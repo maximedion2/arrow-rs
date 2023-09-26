@@ -1,0 +1,31 @@
+[package]
+name = "arrow-zarr"
+version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
+keywords.workspace = true
+include.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-data = { workspace = true }
+arrow-schema = { workspace = true }
+num-traits = { version = "0.2.14" }
+regex = { version = "1.9.5" }
+rayon = { version = "1.8" }
+serde_json = { version = "1.0.107" }
+serde = {version = "1.0.188", features = ["derive"]}
+flate2 = { version = "1.0.27"}
+bytemuck = { version = "1.14.0" }
+itertools = { version = "0.11.0"}
+bzip2 = { version = "0.4.4" }
+rust-lzma = { version = "0.6.0" }
+blosc = { version = "0.2.0" }

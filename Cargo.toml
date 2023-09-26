@@ -36,6 +36,7 @@ members = [
     "arrow-schema",
     "arrow-select",
     "arrow-string",
+    "arrow-zarr",
     "parquet",
     "parquet_derive",
     "parquet_derive_test",
