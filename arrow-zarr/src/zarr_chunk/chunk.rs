@@ -21,7 +21,7 @@ pub enum ZarrError {
 //**********************
 // compressor parameters and utils
 //**********************
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 enum ZarrCompressor {
     Blosc,
     Zlib,
@@ -64,8 +64,8 @@ struct RawOtherOuterParams {
     compressor: RawOtherParams,
 }
 
-#[derive(Debug)]
-pub struct CompressorParams {
+#[derive(Debug, Clone)]
+pub(crate) struct CompressorParams {
     compressor: ZarrCompressor,
     _level: u8,
     _cname: Option<String>,
@@ -73,9 +73,9 @@ pub struct CompressorParams {
 }
 
 impl CompressorParams {
-    pub fn new(path_to_metadata: &str) -> Result<Option<Self>, ZarrError> {
-        let metadata =
-            fs::read_to_string(&path_to_metadata).expect("Unable to read .zarray");
+    pub(crate) fn new(path_to_metadata: &str) -> Result<Option<Self>, ZarrError> {
+        let metadata = fs::read_to_string(&path_to_metadata)
+            .expect(&format!("Unable to read .zarray at {}", path_to_metadata));
 
         // check for Blosc params
         let j: Result<RawBloscOuterParams, serde_json::Error> =
@@ -83,7 +83,7 @@ impl CompressorParams {
         if let Ok(raw_params) = j {
             if raw_params.compressor.id != "blosc" {
                 return Err(ZarrError::InvalidCompressorOptions(
-                    "Invalid compressor parameters".to_string(),
+                    "expect compressor id to be blosc given parameters".to_string(),
                 ));
             }
             return Ok(Some(CompressorParams {
@@ -100,7 +100,7 @@ impl CompressorParams {
         if let Ok(raw_params) = j {
             if raw_params.compressor.id != "lzma" {
                 return Err(ZarrError::InvalidCompressorOptions(
-                    "Invalid compressor parameters".to_string(),
+                    "expect compressor id to be lzma given parameters".to_string(),
                 ));
             }
             return Ok(Some(CompressorParams {
@@ -117,7 +117,7 @@ impl CompressorParams {
         if let Ok(raw_params) = j {
             if raw_params.compressor.id != "zlib" && raw_params.compressor.id != "bz2" {
                 return Err(ZarrError::InvalidCompressorOptions(
-                    "Invalid compressor parameters".to_string(),
+                    "expect compressor id to be zlib or bz2 given parameters".to_string(),
                 ));
             }
             let comp = if raw_params.compressor.id == "zlib" {
@@ -151,8 +151,8 @@ fn decompress_blosc(chunk_data: &[u8], output: &mut [u8]) -> Result<(), ZarrErro
 }
 
 fn decompress_zlib(chunk_data: &[u8], output: &mut [u8]) -> Result<(), ZarrError> {
-    let mut z = ZlibDecoder::new(&chunk_data[..]);
-    z.read(&mut output[..]).unwrap();
+    let mut z = ZlibDecoder::new(chunk_data);
+    z.read(output).unwrap();
     Ok(())
 }
 
@@ -173,43 +173,38 @@ fn decompress_chunk(
     chunk_data: &[u8],
     output: &mut [u8],
     compressor_params: Option<&CompressorParams>,
-) -> Result<(), ZarrError> {
+) {
     if let Some(comp) = compressor_params {
-        if comp.compressor == ZarrCompressor::Zlib {
-            return decompress_zlib(chunk_data, output);
+        match comp.compressor {
+            ZarrCompressor::Zlib => {
+                decompress_zlib(chunk_data, output).unwrap();
+            }
+            ZarrCompressor::Bz2 => {
+                decompress_bz2(chunk_data, output).unwrap();
+            }
+            ZarrCompressor::Lzma => {
+                decompress_lzma(chunk_data, output).unwrap();
+            }
+            ZarrCompressor::Blosc => {
+                decompress_blosc(chunk_data, output).unwrap();
+            }
         }
-
-        if comp.compressor == ZarrCompressor::Bz2 {
-            return decompress_bz2(chunk_data, output);
-        }
-
-        if comp.compressor == ZarrCompressor::Lzma {
-            return decompress_lzma(chunk_data, output);
-        }
-
-        if comp.compressor == ZarrCompressor::Blosc {
-            return decompress_blosc(chunk_data, output);
-        }
-
-        return Err(ZarrError::InvalidCompressorOptions(
-            "compression options not supported".to_string(),
-        ));
+        return;
     }
 
     output.copy_from_slice(chunk_data);
-    Ok(())
 }
 
 //**********************
-// chunk parameters
+// array parameters
 //**********************
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Endianness {
     Little,
     Big,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum MatrixOrder {
     RowMajor,
     ColumnMajor,
@@ -224,8 +219,8 @@ struct RawArrayParams {
     order: String,
 }
 
-#[derive(Debug)]
-pub struct ArrayParams {
+#[derive(Debug, Clone)]
+pub(crate) struct ArrayParams {
     n_dims: u8,
     shape: Vec<usize>,
     chunks: Vec<usize>,
@@ -234,7 +229,7 @@ pub struct ArrayParams {
 }
 
 impl ArrayParams {
-    pub fn new(path_to_metadata: &str) -> Result<Self, ZarrError> {
+    pub(crate) fn new(path_to_metadata: &str) -> Result<Self, ZarrError> {
         let metadata =
             fs::read_to_string(&path_to_metadata).expect("Unable to read .zarray");
         let j: Result<RawArrayParams, serde_json::Error> =
@@ -246,9 +241,10 @@ impl ArrayParams {
                 ));
             }
             if raw_params.chunks.len() != raw_params.shape.len() {
-                return Err(ZarrError::InvalidArrayParams(
-                    "mismatch between shape and chunks dimensions".to_string(),
-                ));
+                return Err(ZarrError::InvalidArrayParams(format!(
+                    "dimenstion mismatch between shape {:?} and chunks {:?}",
+                    raw_params.shape, raw_params.chunks
+                )));
             }
             if raw_params.shape.len() > 3 {
                 return Err(ZarrError::InvalidArrayParams(
@@ -262,9 +258,10 @@ impl ArrayParams {
                 _ => None,
             };
             if order.is_none() {
-                return Err(ZarrError::InvalidArrayParams(
-                    "invalid matrix order in array params".to_string(),
-                ));
+                return Err(ZarrError::InvalidArrayParams(format!(
+                    "invalid matrix order {} in array params",
+                    raw_params.order.as_str()
+                )));
             }
 
             let endianness = match raw_params.dtype.chars().next().unwrap() {
@@ -292,11 +289,11 @@ impl ArrayParams {
         )))
     }
 
-    pub fn get_chunks(&self) -> &Vec<usize> {
+    pub(crate) fn get_chunks(&self) -> &Vec<usize> {
         &self.chunks
     }
 
-    pub fn get_shape(&self) -> &Vec<usize> {
+    pub(crate) fn get_shape(&self) -> &Vec<usize> {
         &self.shape
     }
 }
@@ -318,7 +315,6 @@ pub trait ZarrRead {
 //**********************
 pub struct LocalZarrFile {
     path: String,
-    grid_pos: Vec<usize>,
     chunk_dims: Vec<usize>,
     is_edge_chunk: bool,
 }
@@ -336,7 +332,7 @@ impl LocalZarrFile {
             .zip(shape)
             .map(|(&chnk, &shp)| (shp as f64 / chnk as f64).ceil() as usize)
             .collect();
-        let real_chunks: Vec<usize> = chunks
+        let real_chunks_dims: Vec<usize> = chunks
             .iter()
             .zip(shape)
             .zip(n_chunks)
@@ -352,8 +348,7 @@ impl LocalZarrFile {
             .collect();
         LocalZarrFile {
             path: path,
-            grid_pos: position,
-            chunk_dims: real_chunks,
+            chunk_dims: real_chunks_dims,
             is_edge_chunk: is_edge_chunk,
         }
     }
@@ -367,7 +362,7 @@ impl ZarrRead for LocalZarrFile {
     fn read_into_buf(&self, output_buf: &mut [u8]) -> Result<(), ZarrError> {
         if !self.exists() {
             return Err(ZarrError::ChunkError(format!(
-                "could not find {}",
+                "could not find chunk file {}",
                 self.path
             )));
         }
@@ -379,7 +374,7 @@ impl ZarrRead for LocalZarrFile {
     fn get_buf(&self) -> Result<Vec<u8>, ZarrError> {
         if !self.exists() {
             return Err(ZarrError::ChunkError(format!(
-                "could not find {}",
+                "could not find chunk file {}",
                 self.path
             )));
         }
@@ -408,20 +403,24 @@ pub struct ZarrChunkReader<'a, T: Copy, Z: ZarrRead> {
     params: &'a ArrayParams,
     compressor_params: Option<&'a CompressorParams>,
     fill_value: T,
+    full_chunk_size: usize,
 }
 
 impl<'a, T: Copy, Z: ZarrRead> ZarrChunkReader<'a, T, Z> {
-    pub fn new(
+    pub(crate) fn new(
         chunk_file: &'a Z,
         params: &'a ArrayParams,
         compressor_params: Option<&'a CompressorParams>,
         fill_value: T,
     ) -> Self {
+        let full_chunk_size: usize =
+            params.chunks.iter().fold(1, |mult, &x| mult * x as usize);
         ZarrChunkReader {
             chunk_file: chunk_file,
             params: params,
             compressor_params: compressor_params,
             fill_value: fill_value,
+            full_chunk_size: full_chunk_size,
         }
     }
 
@@ -452,15 +451,14 @@ impl<'a, T: Copy, Z: ZarrRead> ZarrChunkReader<'a, T, Z> {
                 .map(|t| t.0 * self.params.chunks[1] + t.1)
                 .collect();
         } else if self.params.n_dims == 3 {
-            let [first_dim, second_dim, thrid_dim] = self.get_3d_dim_order();
+            let [first_dim, second_dim, third_dim] = self.get_3d_dim_order();
             indices_to_keep = (0..real_chunk_dims[first_dim])
                 .cartesian_product(0..real_chunk_dims[second_dim])
-                .cartesian_product(0..real_chunk_dims[thrid_dim])
+                .cartesian_product(0..real_chunk_dims[third_dim])
                 .map(|t| {
-                    (t.0 .0 * self.params.chunks[1] * self.params.chunks[2]
+                    t.0 .0 * self.params.chunks[1] * self.params.chunks[2]
                         + t.0 .1 * self.params.chunks[2]
-                        + t.1)
-                        * type_size
+                        + t.1
                 })
                 .collect();
         }
@@ -479,13 +477,7 @@ impl<'a, T: Copy, Z: ZarrRead> ZarrChunkReader<'a, T, Z> {
 //**********************
 impl<'a, T: Copy + Pod, Z: ZarrRead> Read for ZarrChunkReader<'a, T, Z> {
     fn read(&mut self, output_buf: &mut [u8]) -> Result<usize, std::io::Error> {
-        // determine the amount of bytes to write and the number of elements
-        // in a full (non edge) chunk
-        let full_chunk_size: usize = self
-            .params
-            .chunks
-            .iter()
-            .fold(1, |mult, &x| mult * x as usize);
+        // determine the amount of bytes to write
         let write_size = self.chunk_file.get_chunk_size() * std::mem::size_of::<T>();
 
         // handle the (simpler) case where it's not an edge chunk
@@ -497,13 +489,12 @@ impl<'a, T: Copy + Pod, Z: ZarrRead> Read for ZarrChunkReader<'a, T, Z> {
                         &buf[..],
                         &mut output_buf[..write_size],
                         self.compressor_params,
-                    )
-                    .unwrap();
+                    );
                 } else {
                     self.chunk_file.read_into_buf(output_buf).unwrap();
                 }
             } else {
-                let typed_data = vec![self.fill_value; full_chunk_size];
+                let typed_data = vec![self.fill_value; self.full_chunk_size];
                 output_buf[..write_size].copy_from_slice(&cast_slice(&typed_data));
             }
             return Ok(write_size);
@@ -514,15 +505,14 @@ impl<'a, T: Copy + Pod, Z: ZarrRead> Read for ZarrChunkReader<'a, T, Z> {
         if self.chunk_file.exists() {
             if let Some(_comp) = self.compressor_params {
                 let buf = self.chunk_file.get_buf().unwrap();
-                data = vec![0u8; full_chunk_size * std::mem::size_of::<T>()];
-                decompress_chunk(&buf[..], &mut data[..], self.compressor_params)
-                    .unwrap();
+                data = vec![0u8; self.full_chunk_size * std::mem::size_of::<T>()];
+                decompress_chunk(&buf[..], &mut data[..], self.compressor_params);
             } else {
                 data = self.chunk_file.get_buf().unwrap();
             }
         } else {
-            let typed_data = vec![self.fill_value; full_chunk_size];
-            data = vec![0u8; full_chunk_size * std::mem::size_of::<T>()];
+            let typed_data = vec![self.fill_value; self.full_chunk_size];
+            data = vec![0u8; self.full_chunk_size * std::mem::size_of::<T>()];
             data.copy_from_slice(&cast_slice(&typed_data));
         }
 
@@ -559,12 +549,8 @@ mod zarr_chunk_tests {
         let arr_params: ArrayParams = ArrayParams::new(&zarray_path).unwrap();
         let comp_params = CompressorParams::new(&zarray_path).unwrap();
 
-        let chunk_file = LocalZarrFile::new(
-            chunk_path,
-            pos,
-            arr_params.get_shape(),
-            arr_params.get_chunks(),
-        );
+        let chunk_file =
+            LocalZarrFile::new(chunk_path, pos, &arr_params.shape, &arr_params.chunks);
         let mut chunk: ZarrChunkReader<T, LocalZarrFile> = ZarrChunkReader::new(
             &chunk_file,
             &arr_params,
