@@ -65,7 +65,7 @@ struct RawOtherOuterParams {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CompressorParams {
+pub struct CompressorParams {
     compressor: ZarrCompressor,
     _level: u8,
     _cname: Option<String>,
@@ -73,7 +73,7 @@ pub(crate) struct CompressorParams {
 }
 
 impl CompressorParams {
-    pub(crate) fn new(path_to_metadata: &str) -> Result<Option<Self>, ZarrError> {
+    pub fn new(path_to_metadata: &str) -> Result<Option<Self>, ZarrError> {
         let metadata = fs::read_to_string(&path_to_metadata)
             .expect(&format!("Unable to read .zarray at {}", path_to_metadata));
 
@@ -83,7 +83,7 @@ impl CompressorParams {
         if let Ok(raw_params) = j {
             if raw_params.compressor.id != "blosc" {
                 return Err(ZarrError::InvalidCompressorOptions(
-                    "expect compressor id to be blosc given parameters".to_string(),
+                    "expected compressor id to be blosc given parameters".to_string(),
                 ));
             }
             return Ok(Some(CompressorParams {
@@ -100,7 +100,7 @@ impl CompressorParams {
         if let Ok(raw_params) = j {
             if raw_params.compressor.id != "lzma" {
                 return Err(ZarrError::InvalidCompressorOptions(
-                    "expect compressor id to be lzma given parameters".to_string(),
+                    "expected compressor id to be lzma given parameters".to_string(),
                 ));
             }
             return Ok(Some(CompressorParams {
@@ -117,7 +117,8 @@ impl CompressorParams {
         if let Ok(raw_params) = j {
             if raw_params.compressor.id != "zlib" && raw_params.compressor.id != "bz2" {
                 return Err(ZarrError::InvalidCompressorOptions(
-                    "expect compressor id to be zlib or bz2 given parameters".to_string(),
+                    "expected compressor id to be zlib or bz2 given parameters"
+                        .to_string(),
                 ));
             }
             let comp = if raw_params.compressor.id == "zlib" {
@@ -220,7 +221,7 @@ struct RawArrayParams {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ArrayParams {
+pub struct ArrayParams {
     n_dims: u8,
     shape: Vec<usize>,
     chunks: Vec<usize>,
@@ -229,7 +230,7 @@ pub(crate) struct ArrayParams {
 }
 
 impl ArrayParams {
-    pub(crate) fn new(path_to_metadata: &str) -> Result<Self, ZarrError> {
+    pub fn new(path_to_metadata: &str) -> Result<Self, ZarrError> {
         let metadata =
             fs::read_to_string(&path_to_metadata).expect("Unable to read .zarray");
         let j: Result<RawArrayParams, serde_json::Error> =
@@ -289,11 +290,11 @@ impl ArrayParams {
         )))
     }
 
-    pub(crate) fn get_chunks(&self) -> &Vec<usize> {
+    pub fn get_chunks(&self) -> &Vec<usize> {
         &self.chunks
     }
 
-    pub(crate) fn get_shape(&self) -> &Vec<usize> {
+    pub fn get_shape(&self) -> &Vec<usize> {
         &self.shape
     }
 }
@@ -407,7 +408,7 @@ pub struct ZarrChunkReader<'a, T: Copy, Z: ZarrRead> {
 }
 
 impl<'a, T: Copy, Z: ZarrRead> ZarrChunkReader<'a, T, Z> {
-    pub(crate) fn new(
+    pub fn new(
         chunk_file: &'a Z,
         params: &'a ArrayParams,
         compressor_params: Option<&'a CompressorParams>,
@@ -568,7 +569,7 @@ mod zarr_chunk_tests {
 
     #[test]
     fn data_with_no_compression() {
-        let store_name = "example1.zarr";
+        let store_name = "no_compression_chunk_test.zarr";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -582,7 +583,7 @@ mod zarr_chunk_tests {
     #[test]
     fn data_with_zlib_compression() {
         // level = 1
-        let store_name = "example2.zarr/zlib_level1";
+        let store_name = "compressor_chunk_test.zarr/zlib_level1";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -593,7 +594,7 @@ mod zarr_chunk_tests {
         );
 
         // level = 2
-        let store_name = "example2.zarr/zlib_level2";
+        let store_name = "compressor_chunk_test.zarr/zlib_level2";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -607,7 +608,7 @@ mod zarr_chunk_tests {
     #[test]
     fn data_with_bz2_compression() {
         // level = 1
-        let store_name = "example2.zarr/bz2_level1";
+        let store_name = "compressor_chunk_test.zarr/bz2_level1";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -618,7 +619,7 @@ mod zarr_chunk_tests {
         );
 
         // level = 2
-        let store_name = "example2.zarr/bz2_level2";
+        let store_name = "compressor_chunk_test.zarr/bz2_level2";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -632,7 +633,7 @@ mod zarr_chunk_tests {
     #[test]
     fn data_with_lzma_compression() {
         // preset = 0
-        let store_name = "example2.zarr/lzma_preset0";
+        let store_name = "compressor_chunk_test.zarr/lzma_preset0";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -643,7 +644,7 @@ mod zarr_chunk_tests {
         );
 
         // preset = 1
-        let store_name = "example2.zarr/lzma_preset1";
+        let store_name = "compressor_chunk_test.zarr/lzma_preset1";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -657,7 +658,7 @@ mod zarr_chunk_tests {
     #[test]
     fn data_with_zlib_through_blosc_compression() {
         // level = 1, shuffle = 0
-        let store_name = "example2.zarr/zlib_w_blosc_shuffle0_level1";
+        let store_name = "compressor_chunk_test.zarr/zlib_w_blosc_shuffle0_level1";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -668,7 +669,7 @@ mod zarr_chunk_tests {
         );
 
         // level = 2, shuffle = 1
-        let store_name = "example2.zarr/zlib_w_blosc_shuffle1_level2";
+        let store_name = "compressor_chunk_test.zarr/zlib_w_blosc_shuffle1_level2";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -682,7 +683,7 @@ mod zarr_chunk_tests {
     #[test]
     fn data_with_lz4_through_blosc_compression() {
         // level = 1, shuffle = 0
-        let store_name = "example2.zarr/lz4_w_blosc_shuffle0_level1";
+        let store_name = "compressor_chunk_test.zarr/lz4_w_blosc_shuffle0_level1";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -693,7 +694,7 @@ mod zarr_chunk_tests {
         );
 
         // level = 2, shuffle = 1
-        let store_name = "example2.zarr/lz4_w_blosc_shuffle1_level2";
+        let store_name = "compressor_chunk_test.zarr/lz4_w_blosc_shuffle1_level2";
         read_chunk_and_assert::<i16>(
             &store_name,
             18,
@@ -706,7 +707,7 @@ mod zarr_chunk_tests {
 
     #[test]
     fn data_with_edge_chunks() {
-        let store_name = "example3.zarr";
+        let store_name = "edge_chunk_test.zarr";
         read_chunk_and_assert::<i16>(
             &store_name,
             12,
@@ -719,7 +720,7 @@ mod zarr_chunk_tests {
 
     #[test]
     fn column_major_data_with_edge_chunks_and() {
-        let store_name = "example5.zarr";
+        let store_name = "column_major_chunk_test.zarr";
         read_chunk_and_assert::<i16>(
             &store_name,
             12,

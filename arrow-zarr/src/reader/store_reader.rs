@@ -1,13 +1,14 @@
+use arrow_data::ArrayData;
 use itertools::Itertools;
 
 use crate::zarr_chunk::chunk::{
     ArrayParams, CompressorParams, LocalZarrFile, ZarrChunkReader, ZarrError, ZarrRead,
 };
 use arrow_array::*;
+use arrow_buffer::Buffer;
 use arrow_schema::ArrowError;
 use arrow_schema::{DataType, TimeUnit};
 use arrow_schema::{Field, FieldRef, Schema};
-use bytemuck::cast_slice;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
@@ -211,42 +212,57 @@ impl ZarrLocalStoreReader {
 //**********************
 fn build_array(buf: Vec<u8>, dtype: &str) -> Result<ArrayRef, ArrowError> {
     let arr: ArrayRef;
-    macro_rules! build_arr {
-        ($data_type: ty, $arrow_type: ty) => {{
-            let v: Vec<Option<$data_type>> =
-                cast_slice(&buf).to_vec().into_iter().map(Some).collect();
-            arr = Arc::new(<$arrow_type>::from(v));
+
+    macro_rules! build_arr2 {
+        ($arr_type: ty, $data_type: path, $native_type: ty) => {{
+            let data = ArrayData::builder($data_type)
+                .len(buf.len() / std::mem::size_of::<$native_type>())
+                .add_buffer(Buffer::from(buf))
+                .build()
+                .unwrap();
+            arr = Arc::new(<$arr_type>::from(data));
+        }};
+    }
+
+    macro_rules! build_ts_arr {
+        ($arr_type: ty, $time_unit: path) => {{
+            let data = ArrayData::builder(DataType::Timestamp($time_unit, None))
+                .len(buf.len() / std::mem::size_of::<i64>())
+                .add_buffer(Buffer::from(buf))
+                .build()
+                .unwrap();
+            arr = Arc::new(<$arr_type>::from(data));
         }};
     }
 
     if dtype.contains("u1") {
-        build_arr!(u8, UInt8Array);
+        build_arr2!(UInt8Array, DataType::UInt8, u8);
     } else if dtype.contains("u2") {
-        build_arr!(u16, UInt16Array);
+        build_arr2!(UInt16Array, DataType::UInt16, u16);
     } else if dtype.contains("u4") {
-        build_arr!(u32, UInt32Array);
+        build_arr2!(UInt32Array, DataType::UInt32, u32);
     } else if dtype.contains("u8") {
-        build_arr!(u64, UInt64Array);
+        build_arr2!(UInt64Array, DataType::UInt64, u64);
     } else if dtype.contains("i1") {
-        build_arr!(i8, Int8Array);
+        build_arr2!(Int8Array, DataType::Int8, i8);
     } else if dtype.contains("i2") {
-        build_arr!(i16, Int16Array);
+        build_arr2!(Int16Array, DataType::Int16, i16);
     } else if dtype.contains("i4") {
-        build_arr!(i32, Int32Array);
+        build_arr2!(Int32Array, DataType::Int32, i32);
     } else if dtype.contains("i8") {
-        build_arr!(i64, Int64Array);
+        build_arr2!(Int64Array, DataType::Int64, i64);
     } else if dtype.contains("f4") {
-        build_arr!(f32, Float32Array);
+        build_arr2!(Float32Array, DataType::Float32, f32);
     } else if dtype.contains("f8") {
-        build_arr!(f64, Float64Array);
+        build_arr2!(Float64Array, DataType::Float64, f64);
     } else if dtype.contains("M8[s]") {
-        build_arr!(i64, TimestampSecondArray);
+        build_ts_arr!(TimestampSecondArray, TimeUnit::Second);
     } else if dtype.contains("M8[ms]") {
-        build_arr!(i64, TimestampMillisecondArray);
+        build_ts_arr!(TimestampMillisecondArray, TimeUnit::Millisecond);
     } else if dtype.contains("M8[us]") {
-        build_arr!(i64, TimestampMicrosecondArray);
+        build_ts_arr!(TimestampMicrosecondArray, TimeUnit::Microsecond);
     } else if dtype.contains("M8[ns]") {
-        build_arr!(i64, TimestampNanosecondArray);
+        build_ts_arr!(TimestampNanosecondArray, TimeUnit::Nanosecond);
     } else {
         return Err(ArrowError::ParseError(format!(
             "Unsupported data type {} when creating array",
@@ -361,8 +377,7 @@ impl<Z: ZarrRead> Iterator for ZarrStoreReader<Z> {
         let mut arrs: Vec<ArrayRef> = Vec::with_capacity(self.vars.len());
         for var in self.vars.iter() {
             arrs.push(
-                build_array(buffers.get_mut(var).unwrap().to_vec(), &self.types[var])
-                    .unwrap(),
+                build_array(buffers.remove(var).unwrap(), &self.types[var]).unwrap(),
             );
         }
 
@@ -373,7 +388,7 @@ impl<Z: ZarrRead> Iterator for ZarrStoreReader<Z> {
 //**********************
 // a builder for zarr store readers
 //**********************
-struct ZarrStoreReaderBuilder<Z: ZarrRead> {
+pub struct ZarrStoreReaderBuilder<Z: ZarrRead> {
     store_path: String,
     grid_positions: Vec<Vec<usize>>,
     vars: Vec<String>,
@@ -388,56 +403,8 @@ struct ZarrStoreReaderBuilder<Z: ZarrRead> {
     marker: std::marker::PhantomData<Z>,
 }
 
-impl ZarrStoreReaderBuilder<LocalZarrFile> {
-    pub fn build(self) -> ZarrLocalStoreReader {
-        ZarrStoreReader::new(
-            &self.store_path,
-            self.vars,
-            self.grid_positions,
-            self.compressor_params,
-            self.array_params,
-            self.fill_values,
-            self.types,
-            &self.chunks,
-            &self.shape,
-            self.combine_chunks,
-        )
-        .unwrap()
-    }
-
-    pub fn build_multiple(self, n_readers: usize) -> Vec<ZarrLocalStoreReader> {
-        let n_chunks =
-            (self.grid_positions.len() as f64 / n_readers as f64).ceil() as usize;
-        // the to_vec and clone calls are because of the closure that's run
-        // multiple times, calling the build_multiple consumes the builder but
-        // we can't have the readers take ownership since there's more than one.
-        self.grid_positions
-            .chunks(n_chunks)
-            .map(|grid_pos| {
-                ZarrLocalStoreReader::new(
-                    &self.store_path,
-                    self.vars.to_vec(),
-                    grid_pos.to_vec(),
-                    self.compressor_params.clone(),
-                    self.array_params.clone(),
-                    self.fill_values.clone(),
-                    self.types.clone(),
-                    &self.chunks,
-                    &self.shape,
-                    self.combine_chunks,
-                )
-                .unwrap()
-            })
-            .collect()
-    }
-}
-
-impl ZarrStoreReaderBuilder<LocalZarrFile> {
-    pub fn new(
-        store_path: String,
-        vars: Vec<String>,
-        combine_chunks: bool,
-    ) -> Result<Self, ZarrError> {
+impl<Z: ZarrRead> ZarrStoreReaderBuilder<Z> {
+    pub fn new(store_path: String, combine_chunks: bool) -> Result<Self, ZarrError> {
         let mut chunks: Option<Vec<usize>> = None;
         let mut shape: Option<Vec<usize>> = None;
         let mut c_params: HashMap<String, Option<CompressorParams>> = HashMap::new();
@@ -449,6 +416,23 @@ impl ZarrStoreReaderBuilder<LocalZarrFile> {
         let integer_re = Regex::new(r"([\|><][ui][1248])").unwrap();
         let float_re = Regex::new(r"([\|><]f[48])").unwrap();
         let ts_re = Regex::new(r"([\|><]M8(\[s\]|\[ms\]|\[us\]|\[ns\]))").unwrap();
+
+        let mut vars: Vec<String> = fs::read_dir(&store_path)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.is_ok())
+            .map(|r| r.unwrap().path())
+            .filter(|r| r.is_dir())
+            .map(|p| {
+                p.as_path()
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        vars.sort();
 
         // go through the variables and make sure that chunks and shapes are
         // valid and consistent across variables. also extract fill values
@@ -550,6 +534,58 @@ impl ZarrStoreReaderBuilder<LocalZarrFile> {
             marker: std::marker::PhantomData,
         })
     }
+
+    pub fn as_projection(mut self, vars: Vec<String>) -> Self {
+        self.vars = vars;
+        self
+    }
+}
+
+//**********************
+// implement build methods for a zarr store builder on local files
+//**********************
+impl ZarrStoreReaderBuilder<LocalZarrFile> {
+    pub fn build(self) -> ZarrLocalStoreReader {
+        ZarrStoreReader::new(
+            &self.store_path,
+            self.vars,
+            self.grid_positions,
+            self.compressor_params,
+            self.array_params,
+            self.fill_values,
+            self.types,
+            &self.chunks,
+            &self.shape,
+            self.combine_chunks,
+        )
+        .unwrap()
+    }
+
+    pub fn build_multiple(self, n_readers: usize) -> Vec<ZarrLocalStoreReader> {
+        let n_chunks =
+            (self.grid_positions.len() as f64 / n_readers as f64).ceil() as usize;
+        // the to_vec and clone calls are because of the closure that's run
+        // multiple times, calling the build_multiple consumes the builder but
+        // we can't have the readers take ownership since there's more than one.
+        self.grid_positions
+            .chunks(n_chunks)
+            .map(|grid_pos| {
+                ZarrLocalStoreReader::new(
+                    &self.store_path,
+                    self.vars.to_vec(),
+                    grid_pos.to_vec(),
+                    self.compressor_params.clone(),
+                    self.array_params.clone(),
+                    self.fill_values.clone(),
+                    self.types.clone(),
+                    &self.chunks,
+                    &self.shape,
+                    self.combine_chunks,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -558,20 +594,21 @@ mod zarr_store_reader_tests {
         cast::AsArray,
         types::{Float64Type, Int64Type, TimestampMillisecondType, UInt32Type},
     };
+    use std::collections::HashSet;
 
     use super::*;
+    const _TEST_DATA_PATH: &str =
+        "/home/maxime/Documents/repos/arrow-rs/testing/data/zarr/";
 
     #[test]
     fn single_reader_all_chunks_at_once() {
-        let store_path =
-            "/home/maxime/Documents/repos/arrow-rs/testing/data/zarr/example6.zarr/";
-        let vars = vec![
-            "lat".to_string(),
-            "lon".to_string(),
-            "temperature".to_string(),
-        ];
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("float_data_reader_test.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
         let builder: ZarrStoreReaderBuilder<LocalZarrFile> =
-            ZarrStoreReaderBuilder::new(store_path.to_string(), vars, true).unwrap();
+            ZarrStoreReaderBuilder::new(store_path.to_string(), true).unwrap();
         let mut reader = builder.build();
         let record_batch = reader.next().unwrap().unwrap();
 
@@ -633,16 +670,41 @@ mod zarr_store_reader_tests {
     }
 
     #[test]
+    fn read_with_projection() {
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("float_data_reader_test.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut builder: ZarrStoreReaderBuilder<LocalZarrFile> =
+            ZarrStoreReaderBuilder::new(store_path.to_string(), true).unwrap();
+        let vars = vec!["lat".to_string(), "lon".to_string()];
+        builder = builder.as_projection(vars.clone());
+
+        let mut reader = builder.build();
+        let record_batch = reader.next().unwrap().unwrap();
+
+        let fields: Vec<String> = record_batch
+            .schema()
+            .fields
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect();
+
+        assert_eq!(fields.len(), 2);
+        let target_fields: HashSet<String> = vars.into_iter().collect();
+        assert_eq!(HashSet::from_iter(fields), target_fields);
+    }
+
+    #[test]
     fn single_reader_chunks_one_at_a_time() {
-        let store_path =
-            "/home/maxime/Documents/repos/arrow-rs/testing/data/zarr/example6.zarr/";
-        let vars = vec![
-            "lat".to_string(),
-            "lon".to_string(),
-            "temperature".to_string(),
-        ];
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("float_data_reader_test.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
         let builder: ZarrStoreReaderBuilder<LocalZarrFile> =
-            ZarrStoreReaderBuilder::new(store_path.to_string(), vars, false).unwrap();
+            ZarrStoreReaderBuilder::new(store_path.to_string(), false).unwrap();
         let reader = builder.build();
 
         let mut n_reads = 0;
@@ -673,15 +735,13 @@ mod zarr_store_reader_tests {
 
     #[test]
     fn multiple_readers_all_chunks_at_once() {
-        let store_path =
-            "/home/maxime/Documents/repos/arrow-rs/testing/data/zarr/example6.zarr/";
-        let vars = vec![
-            "lat".to_string(),
-            "lon".to_string(),
-            "temperature".to_string(),
-        ];
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("float_data_reader_test.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
         let builder: ZarrStoreReaderBuilder<LocalZarrFile> =
-            ZarrStoreReaderBuilder::new(store_path.to_string(), vars, true).unwrap();
+            ZarrStoreReaderBuilder::new(store_path.to_string(), true).unwrap();
         let mut readers = builder.build_multiple(2);
         let record_batch1 = readers[0].next().unwrap().unwrap();
         let record_batch2 = readers[1].next().unwrap().unwrap();
@@ -706,16 +766,52 @@ mod zarr_store_reader_tests {
     }
 
     #[test]
-    fn multiple_readers_chunks_one_at_a_time() {
-        let store_path =
-            "/home/maxime/Documents/repos/arrow-rs/testing/data/zarr/example6.zarr/";
-        let vars = vec![
-            "lat".to_string(),
-            "lon".to_string(),
-            "temperature".to_string(),
-        ];
+    fn readers_with_threads() {
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("float_data_reader_test.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
         let builder: ZarrStoreReaderBuilder<LocalZarrFile> =
-            ZarrStoreReaderBuilder::new(store_path.to_string(), vars, false).unwrap();
+            ZarrStoreReaderBuilder::new(store_path.to_string(), true).unwrap();
+        let mut readers = builder.build_multiple(2);
+        let mut reader1 = readers.remove(0);
+        let mut reader2 = readers.remove(0);
+
+        let handle1 = std::thread::spawn(move || reader1.next().unwrap().unwrap());
+        let handle2 = std::thread::spawn(move || reader2.next().unwrap().unwrap());
+
+        let record_batch1 = handle1.join().unwrap();
+        let record_batch2 = handle2.join().unwrap();
+
+        assert_eq!(
+            record_batch1
+                .column(0)
+                .as_primitive::<Float64Type>()
+                .values(),
+            &[
+                32.0, 33.0, 32.0, 33.0, 34.0, 35.0, 34.0, 35.0, 36.0, 36.0, 32.0, 33.0,
+                32.0, 33.0, 34.0, 35.0, 34.0, 35.0
+            ]
+        );
+        assert_eq!(
+            record_batch2
+                .column(0)
+                .as_primitive::<Float64Type>()
+                .values(),
+            &[36.0, 36.0, 32.0, 33.0, 34.0, 35.0, 36.0]
+        );
+    }
+
+    #[test]
+    fn multiple_readers_chunks_one_at_a_time() {
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("float_data_reader_test.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let builder: ZarrStoreReaderBuilder<LocalZarrFile> =
+            ZarrStoreReaderBuilder::new(store_path.to_string(), false).unwrap();
         let mut readers = builder.build_multiple(2);
 
         let mut n_reads = 0;
@@ -763,36 +859,40 @@ mod zarr_store_reader_tests {
 
     #[test]
     fn timestamps_and_unsigned_ints() {
-        let store_path =
-            "/home/maxime/Documents/repos/arrow-rs/testing/data/zarr/example7.zarr/";
-        let vars = vec!["time".to_string(), "some_count".to_string()];
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("timestamp_data_reader_test.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
         let builder: ZarrStoreReaderBuilder<LocalZarrFile> =
-            ZarrStoreReaderBuilder::new(store_path.to_string(), vars, false).unwrap();
+            ZarrStoreReaderBuilder::new(store_path.to_string(), false).unwrap();
         let mut reader = builder.build();
 
         let mut record_batch = reader.next().unwrap().unwrap();
         assert_eq!(
-            record_batch
-                .column(0)
-                .as_primitive::<TimestampMillisecondType>()
-                .values(),
-            &[1685577600000, 1685664000000, 1686009600000, 1686096000000]
+            record_batch.column(0).as_primitive::<UInt32Type>().values(),
+            &[100, 101, 105, 106]
         );
 
         record_batch = reader.next().unwrap().unwrap();
         assert_eq!(
-            record_batch.column(1).as_primitive::<UInt32Type>().values(),
-            &[102, 103, 107, 108]
+            record_batch
+                .column(1)
+                .as_primitive::<TimestampMillisecondType>()
+                .values(),
+            &[1685750400000, 1685836800000, 1686182400000, 1686268800000]
         );
     }
 
     #[test]
     fn one_d_array() {
-        let store_path =
-            "/home/maxime/Documents/repos/arrow-rs/testing/data/zarr/example8.zarr/";
-        let vars = vec!["some_integer".to_string()];
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("one_d_reader_test.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
         let builder: ZarrStoreReaderBuilder<LocalZarrFile> =
-            ZarrStoreReaderBuilder::new(store_path.to_string(), vars, true).unwrap();
+            ZarrStoreReaderBuilder::new(store_path.to_string(), true).unwrap();
         let mut reader = builder.build();
 
         let record_batch = reader.next().unwrap().unwrap();
@@ -804,11 +904,13 @@ mod zarr_store_reader_tests {
 
     #[test]
     fn three_d_array() {
-        let store_path =
-            "/home/maxime/Documents/repos/arrow-rs/testing/data/zarr/example9.zarr/";
-        let vars = vec!["some_integer".to_string()];
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("three_d_reader_test.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
         let builder: ZarrStoreReaderBuilder<LocalZarrFile> =
-            ZarrStoreReaderBuilder::new(store_path.to_string(), vars, false).unwrap();
+            ZarrStoreReaderBuilder::new(store_path.to_string(), false).unwrap();
         let mut reader = builder.build();
 
         let mut record_batch = reader.next().unwrap().unwrap();
@@ -826,28 +928,19 @@ mod zarr_store_reader_tests {
 
     #[test]
     fn missing_chunks() {
-        let store_path =
-            "/home/maxime/Documents/repos/arrow-rs/testing/data/zarr/example10.zarr/";
-        let vars = vec!["temperature".to_string(), "precipitation".to_string()];
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("missing_chunk_reader_test.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
         let builder: ZarrStoreReaderBuilder<LocalZarrFile> =
-            ZarrStoreReaderBuilder::new(store_path.to_string(), vars, true).unwrap();
+            ZarrStoreReaderBuilder::new(store_path.to_string(), true).unwrap();
         let mut reader = builder.build();
 
-        let mut record_batch = reader.next().unwrap().unwrap();
+        let record_batch = reader.next().unwrap().unwrap();
         assert_eq!(
             record_batch
                 .column(0)
-                .as_primitive::<Float64Type>()
-                .values(),
-            &[
-                15.0, 15.0, 15.0, 15.0, 18.6, 17.63, 11.86, -4.54, 15.0, 15.0, 15.0,
-                15.0, 15.0, 15.0, 15.0, 15.0
-            ],
-        );
-
-        assert_eq!(
-            record_batch
-                .column(1)
                 .as_primitive::<Float64Type>()
                 .values(),
             &[
@@ -855,5 +948,57 @@ mod zarr_store_reader_tests {
                 0.0, 0.0
             ],
         );
+        assert_eq!(
+            record_batch
+                .column(1)
+                .as_primitive::<Float64Type>()
+                .values(),
+            &[
+                15.0, 15.0, 15.0, 15.0, 18.6, 17.63, 11.86, -4.54, 15.0, 15.0, 15.0,
+                15.0, 15.0, 15.0, 15.0, 15.0
+            ],
+        );
+    }
+
+    #[test]
+    fn large_dataset() {
+        let store_path = Path::new(_TEST_DATA_PATH)
+            .join("large_dataset.zarr")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let vars = vec![
+            "lat".to_string(),
+            "lon".to_string(),
+            "temperature".to_string(),
+        ];
+        let mut builder: ZarrStoreReaderBuilder<LocalZarrFile> =
+            ZarrStoreReaderBuilder::new(store_path.to_string(), true).unwrap();
+        builder = builder.as_projection(vars);
+        //let mut reader = builder.build();
+        let mut readers = builder.build_multiple(4);
+
+        let t1 = std::time::Instant::now();
+        //let record_batch = reader.next().unwrap().unwrap();
+        let mut reader1 = readers.remove(0);
+        let mut reader2 = readers.remove(0);
+        let mut reader3 = readers.remove(0);
+        let mut reader4 = readers.remove(0);
+
+        let handle1 = std::thread::spawn(move || reader1.next().unwrap().unwrap());
+        let handle2 = std::thread::spawn(move || reader2.next().unwrap().unwrap());
+        let handle3 = std::thread::spawn(move || reader3.next().unwrap().unwrap());
+        let handle4 = std::thread::spawn(move || reader4.next().unwrap().unwrap());
+
+        let record_batch1 = handle1.join().unwrap();
+        let record_batch2 = handle2.join().unwrap();
+        let record_batch3 = handle3.join().unwrap();
+        let record_batch4 = handle4.join().unwrap();
+
+        println!("{:?} secs", t1.elapsed());
+        println!("{:?}", record_batch1);
+        println!("{:?}", record_batch2);
+        println!("{:?}", record_batch3);
+        println!("{:?}", record_batch4);
     }
 }
