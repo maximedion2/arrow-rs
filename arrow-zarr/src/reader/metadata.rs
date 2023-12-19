@@ -36,8 +36,8 @@ pub(crate) enum ZarrDataType {
 
 #[derive(Debug, PartialEq, Clone)]
 enum Filter {
-    Delta,
-    FixedScaleOffser,
+    _Delta,
+    _FixedScaleOffser,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -79,7 +79,7 @@ impl ZarrArrayMetadata {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub(crate) struct ZarrStoreMetadata {
+pub struct ZarrStoreMetadata {
     columns: Vec<String>,
     chunks: Option<Vec<usize>>,
     shape: Option<Vec<usize>>,

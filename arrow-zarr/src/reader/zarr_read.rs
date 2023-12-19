@@ -1,4 +1,6 @@
-use crate::reader::metadata::{ZarrStoreMetadata, ZarrArrayMetadata};
+use itertools::Itertools;
+
+use crate::reader::metadata::ZarrStoreMetadata;
 use std::collections::HashMap;
 use std::fs::{read_to_string, read};
 use std::path::PathBuf;
@@ -24,7 +26,7 @@ impl ZarrInMemoryArray {
 
 
 #[derive(Debug)]
-pub(crate) struct ZarrInMemoryChunk {
+pub struct ZarrInMemoryChunk {
     data: HashMap<String, ZarrInMemoryArray>,
     real_dims: Vec<usize>,
 }
@@ -45,6 +47,10 @@ impl ZarrInMemoryChunk {
         self.data.insert(col_name, ZarrInMemoryArray::new(data));
     }
 
+    pub(crate) fn get_cols_in_chunk(&self) -> Vec<String> {
+        self.data.keys().map(|s| s.to_string()).collect_vec()
+    }
+
     pub(crate) fn get_real_dims(&self) -> &Vec<usize> {
         &self.real_dims
     }
@@ -61,19 +67,30 @@ pub struct ColumnProjection {
 }
 
 impl ColumnProjection {
-    pub(crate) fn new(skipping: bool, col_names: Vec<String>) -> Self {
+    pub fn new(skipping: bool, col_names: Vec<String>) -> Self {
         Self {skipping, col_names}
     }
-}
+
+    pub(crate) fn get_cols_to_read(&self, all_cols: &Vec<String>) -> Vec<String> {
+        if self.skipping {
+            return all_cols.iter()
+                           .filter(|x| !self.col_names
+                           .contains(x))
+                           .map(|x| x.to_string())
+                           .collect();
+        } else {
+            return self.col_names.clone();
+        }
+    }
+ }
 
 pub trait ZarrRead {
     fn get_zarr_metadata(&self) -> Result<ZarrStoreMetadata, ZarrError>;
     fn get_zarr_chunk(
         &self,
         position: &Vec<usize>,
-        cols: Vec<String>,
+        cols: &Vec<String>,
         real_dims: Vec<usize>,
-        col_proj: Option<&ColumnProjection>
     ) -> Result<ZarrInMemoryChunk, ZarrError>;
 }
 
@@ -103,26 +120,11 @@ impl ZarrRead for PathBuf {
     fn get_zarr_chunk(
         &self,
         position: &Vec<usize>,
-        mut cols: Vec<String>,
+        cols: &Vec<String>,
         real_dims: Vec<usize>,
-        col_proj: Option<&ColumnProjection>,
     ) -> Result<ZarrInMemoryChunk, ZarrError> {
-        if let Some(proj) = col_proj {
-            if proj.skipping {
-                for col in &proj.col_names {
-                    cols.remove(
-                        cols.iter()
-                                   .position(|x| x == col)
-                                   .ok_or(ZarrError::InvalidMetadata("Columnn projection not found".to_string()))?
-                    );
-                }
-            } else {
-                cols = proj.col_names.clone();
-            }
-        }
-
         let mut chunk = ZarrInMemoryChunk::new(real_dims);
-        for var in &cols {
+        for var in cols {
             let s: Vec<String> = position.into_iter().map(|i| i.to_string()).collect();
             let s = s.join(".");
             let path = self.join(var).join(s);
@@ -138,31 +140,13 @@ impl ZarrRead for PathBuf {
     }
 }
 
-pub struct ZarrStore<T: ZarrRead> {
-    meta: ZarrStoreMetadata,
-    chunk_positions: Vec<String>,
-    zarr_reader: T,
-    curr_chunk: usize,
-}
-
-impl<T: ZarrRead> ZarrStore<T> {
-    pub fn new(meta: ZarrStoreMetadata, zarr_reader: T, chunk_positions: Vec<String>) -> Self {
-        Self {
-            meta,
-            chunk_positions,
-            zarr_reader,
-            curr_chunk: 0,
-        }
-    }
-}
-
-
 #[cfg(test)]
 mod zarr_read_tests {
     use super::*;
-    use crate::reader::metadata::{ZarrDataType, MatrixOrder, Endianness};
+    use crate::reader::metadata::{ZarrDataType, MatrixOrder, Endianness, ZarrArrayMetadata};
     use std::path::PathBuf;
     use std::collections::HashSet;
+
 
     fn get_test_data_path(zarr_store: String) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testing/data/zarr").join(zarr_store)
@@ -204,7 +188,7 @@ mod zarr_read_tests {
         // test read from an array where the data is just raw bytes
         let pos = vec![1, 2];
         let chunk = p.get_zarr_chunk(
-            &pos, meta.get_columns().clone(), meta.get_real_dims(&pos), None
+            &pos, meta.get_columns(), meta.get_real_dims(&pos)
         ).unwrap();
         assert_eq!(
             chunk.data.keys().collect::<HashSet<&String>>(),
@@ -217,16 +201,15 @@ mod zarr_read_tests {
 
         // test selecting only one of the 2 columns
         let col_proj = ColumnProjection::new(true, vec!["float_data".to_string()]);
-        let chunk = p.get_zarr_chunk(
-            &pos, meta.get_columns().clone(), meta.get_real_dims(&pos), Some(&col_proj)
-        ).unwrap();
+        let cols = col_proj.get_cols_to_read(meta.get_columns());
+        let chunk = p.get_zarr_chunk(&pos, &cols, meta.get_real_dims(&pos)).unwrap();
         assert_eq!(chunk.data.keys().collect::<Vec<&String>>(), vec!["byte_data"]);
 
         // same as above, but specify columsn to keep instead of to skip
         let col_proj = ColumnProjection::new(false, vec!["float_data".to_string()]);
+        let cols = col_proj.get_cols_to_read(meta.get_columns());
         let chunk = p.get_zarr_chunk(
-            &pos, meta.get_columns().clone(), meta.get_real_dims(&pos), Some(&col_proj)
-        ).unwrap();
+            &pos, &cols, meta.get_real_dims(&pos)).unwrap();
         assert_eq!(chunk.data.keys().collect::<Vec<&String>>(), vec!["float_data"]);
     }
 }
