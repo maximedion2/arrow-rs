@@ -31,6 +31,7 @@ pub(crate) enum ZarrDataType {
     Int(usize),
     Float(usize),
     FixedLengthString(usize),
+    FixedLengthPyUnicode(usize),
     TimeStamp(usize, String),
 }
 
@@ -108,6 +109,8 @@ struct RawArrayParams {
     order: String,
 }
 
+pub const PY_UNICODE_SIZE: usize = 4;
+
 // TODO: this function isn't great, it will work on all valid types (that are supported
 // by this library), but handling invalid types could be improved.
 fn extract_type(dtype: &str) -> ZarrResult<ZarrDataType> {
@@ -118,10 +121,16 @@ fn extract_type(dtype: &str) -> ZarrResult<ZarrDataType> {
     let float_re = Regex::new(r"([\|><])(f)([48])").unwrap();
     let ts_re = Regex::new(r"([\|><])(M8)(\[s\]|\[ms\]|\[us\]|\[ns\])").unwrap();
     let str_re = Regex::new(r"([\|><])(S)").unwrap();
+    let uni_re = Regex::new(r"([\|><])(U)").unwrap();
 
     if str_re.is_match(dtype) {
         let str_len = dtype[2..dtype.len()].parse::<usize>().unwrap();
         return Ok(ZarrDataType::FixedLengthString(str_len))
+    }
+
+    if uni_re.is_match(dtype) {
+        let str_len = dtype[2..dtype.len()].parse::<usize>().unwrap();
+        return Ok(ZarrDataType::FixedLengthPyUnicode(PY_UNICODE_SIZE * str_len))
     }
 
     if let Some(capt) = ts_re.captures(&dtype) {

@@ -1,6 +1,6 @@
 use zarr_read::{ColumnProjection, ZarrRead, ZarrInMemoryChunk, ZarrInMemoryArray};
 use arrow_schema::{Field, FieldRef, Schema, DataType, TimeUnit};
-use metadata::{ZarrStoreMetadata, ZarrDataType,  CompressorType, Endianness, MatrixOrder};
+use metadata::{ZarrStoreMetadata, ZarrDataType,  CompressorType, Endianness, MatrixOrder, PY_UNICODE_SIZE};
 use errors::{ZarrResult, ZarrError};
 use arrow_array::*;
 use std::sync::Arc;
@@ -115,6 +115,9 @@ fn build_field(t: &ZarrDataType, col_name: String) -> ZarrResult<(usize, FieldRe
         ZarrDataType::FixedLengthString(s) => {
             return Ok((*s, Arc::new(Field::new(col_name, DataType::Utf8, false))))
         },
+        ZarrDataType::FixedLengthPyUnicode(s) => {
+            return Ok((*s, Arc::new(Field::new(col_name, DataType::Utf8, false))))
+        }
         ZarrDataType::TimeStamp(8, u) => {
             match u.as_str() {
                 "s" => {
@@ -369,7 +372,7 @@ where
             let meta = self.meta.get_array_meta(&col_name)?;
 
             // get the field, data size and the data raw data from the array
-            let (data_size, field) = build_field(meta.get_type(), col_name)?;
+            let (mut data_size, field) = build_field(meta.get_type(), col_name)?;
             let mut data = arr_chnk.take_data();
 
             // uncompress the data
@@ -386,6 +389,14 @@ where
             // handle edge chunks
             if chunk_dims != real_dims {
                 process_edge_chunk(&mut data, chunk_dims, real_dims, data_size, meta.get_order());
+            }
+
+            // special case of Py Unicode, with 4 byte characters. Here we simply
+            // keep one byte, might need to be more robust, perhaps throw an error
+            // if the other 3 bytes are not 0s.
+            if let ZarrDataType::FixedLengthPyUnicode(_) = meta.get_type() {
+                data = data.iter().step_by(PY_UNICODE_SIZE).copied().collect();
+                data_size = data_size / PY_UNICODE_SIZE;
             }
 
             // create the array
@@ -684,6 +695,7 @@ mod zarr_reader_tests {
         let target_types = HashMap::from([
             ("uint_data".to_string(), DataType::UInt8),
             ("string_data".to_string(), DataType::Utf8),
+            ("utf8_data".to_string(), DataType::Utf8),
         ]);
 
         // bottom edge chunk
@@ -691,6 +703,7 @@ mod zarr_reader_tests {
         validate_names_and_types(&target_types, rec);
         validate_primitive_column::<UInt8Type, u8>(&"uint_data", rec, &[51, 52, 53, 59, 60, 61]);
         validate_string_column("string_data", rec, &["abc61", "abc62", "abc63", "abc69", "abc70", "abc71"]);
+        validate_string_column("utf8_data", rec, &["def61", "def62", "def63", "def69", "def70", "def71"]);
     }
 
     #[test]
