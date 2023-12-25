@@ -6,6 +6,7 @@ use arrow_schema::ArrowError;
 #[derive(Debug)]
 pub enum ZarrError {
     InvalidMetadata(String),
+    InvalidPredicate(String),
     MissingChunk(Vec<usize>),
     MissingArray(String),
     Io(Box<dyn Error + Send + Sync>),
@@ -16,6 +17,7 @@ impl std::fmt::Display for ZarrError {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         match &self {
             ZarrError::InvalidMetadata(msg) => write!(fmt, "Invalid zarr metadata: {msg}"),
+            ZarrError::InvalidPredicate(msg) => write!(fmt, "Invalid zarr predicate: {msg}"),
             ZarrError::MissingChunk(pos) => {
                 let s: Vec<String> = pos.into_iter().map(|i| i.to_string()).collect();
                 let s = s.join(".");

@@ -4,6 +4,8 @@ use regex::Regex;
 use itertools::Itertools;
 use crate::reader::errors::{ZarrError, ZarrResult};
 
+// various enums for the properties of the zarr store and
+// arrays metadata.
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum CompressorType {
     Blosc,
@@ -41,8 +43,11 @@ enum Filter {
     _FixedScaleOffser,
 }
 
+
+/// The metadata for a single zarr array, which holds various parameters
+/// for the data store in the array.
 #[derive(Debug, PartialEq, Clone)]
-pub(crate) struct ZarrArrayMetadata {
+pub struct ZarrArrayMetadata {
     zarr_format: u8,
     data_type: ZarrDataType,
     compressor: Option<CompressorType>,
@@ -79,6 +84,9 @@ impl ZarrArrayMetadata {
     }
 }
 
+/// The metadata for a zarr store made up of one or more zarr arrays,
+/// holding the array metadata for all of the arrays and the parameters
+/// that have to be consistent across all the arrays.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ZarrStoreMetadata {
     columns: Vec<String>,
@@ -109,7 +117,10 @@ struct RawArrayParams {
     order: String,
 }
 
-pub const PY_UNICODE_SIZE: usize = 4;
+
+// This is the byte length of the Py Unicode characters that zarr writes
+// when the output type is set to U<length>.
+pub(crate) const PY_UNICODE_SIZE: usize = 4;
 
 // TODO: this function isn't great, it will work on all valid types (that are supported
 // by this library), but handling invalid types could be improved.

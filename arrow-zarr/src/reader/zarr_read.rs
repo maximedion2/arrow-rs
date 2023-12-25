@@ -1,21 +1,20 @@
 use itertools::Itertools;
-
 use crate::reader::metadata::ZarrStoreMetadata;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{read_to_string, read};
 use std::path::PathBuf;
-
 use crate::reader::errors::ZarrError;
-
 use super::errors::ZarrResult;
 
-#[derive(Debug)]
-pub(crate) struct ZarrInMemoryArray {
+/// An in-memory representation of the data contained in one chunk
+/// of one zarr array. 
+#[derive(Debug, Clone)]
+pub struct ZarrInMemoryArray {
     data: Vec<u8>,
 }
 
 impl ZarrInMemoryArray {
-    pub(crate) fn new(data: Vec<u8>) -> Self {
+    pub fn new(data: Vec<u8>) -> Self {
         Self {data}
     }
 
@@ -24,7 +23,8 @@ impl ZarrInMemoryArray {
     }
 }
 
-
+/// An in-memory representation of the data contained in one chunk
+/// of one whole zarr store with one or more zarr arrays. 
 #[derive(Debug)]
 pub struct ZarrInMemoryChunk {
     data: HashMap<String, ZarrInMemoryArray>,
@@ -39,7 +39,7 @@ impl ZarrInMemoryChunk {
         }
     }
 
-    fn add_array(
+    pub(crate) fn add_array(
         &mut self,
         col_name: String,
         data: Vec<u8>,
@@ -55,8 +55,94 @@ impl ZarrInMemoryChunk {
         &self.real_dims
     }
 
-    pub(crate) fn get_array_data(&mut self, col: &str) -> ZarrResult<ZarrInMemoryArray> {
+    pub(crate) fn take_array(&mut self, col: &str) -> ZarrResult<ZarrInMemoryArray> {
         self.data.remove(col).ok_or(ZarrError::MissingArray(col.to_string()))
+    }
+
+    pub(crate) fn copy_array(&self, col: &str) -> ZarrResult<ZarrInMemoryArray> {
+        Ok(
+            self.data.get(col).ok_or(ZarrError::MissingArray(col.to_string()))?.clone()
+        )
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub(crate) enum ProjectionType {
+    Select,
+    Skip,
+    Null, 
+}
+
+#[derive(Clone)]
+pub struct ZarrProjection {
+    projection_type: ProjectionType,
+    col_names: Option<Vec<String>>,
+}
+
+impl ZarrProjection {
+    pub fn all() -> Self {
+        Self{projection_type: ProjectionType::Null, col_names: None}
+    }
+
+    pub fn skip(col_names: Vec<String>) -> Self {
+        Self{projection_type: ProjectionType::Skip, col_names: Some(col_names)}
+    }
+
+    pub fn keep(col_names: Vec<String>) -> Self {
+        Self { projection_type: ProjectionType::Select, col_names: Some(col_names)}
+    }
+
+    pub(crate) fn apply_selection(&self, all_cols: &Vec<String>) -> ZarrResult<Vec<String>> {
+        match self.projection_type {
+            ProjectionType::Null => {return Ok(all_cols.clone())},
+            ProjectionType::Skip => {
+                let col_names = self.col_names.as_ref().unwrap();
+                return Ok(
+                    all_cols.iter().filter(|x| !col_names.contains(x)).map(|x| x.to_string()).collect()
+                )
+            },
+            ProjectionType::Select => {
+                let col_names = self.col_names.as_ref().unwrap();
+                for col in all_cols {
+                    if !col_names.contains(&col) {
+                        return Err(ZarrError::MissingArray("Column in selection missing columns to select from".to_string()))
+                    }
+                }
+                return Ok(col_names.clone())
+            }
+        }
+    }
+
+    pub(crate) fn update(&mut self, other_proj: ZarrProjection) {
+        if other_proj.projection_type == ProjectionType::Null {
+            return
+        }
+
+        if self.projection_type == ProjectionType::Null {
+            self.projection_type = other_proj.projection_type;
+            self.col_names = other_proj.col_names;
+            return
+        }
+
+        let col_names = self.col_names.as_mut().unwrap();
+        if other_proj.projection_type == self.projection_type {
+            let mut s: HashSet<String> = HashSet::from_iter(col_names.clone().into_iter());
+
+            let other_cols = other_proj.col_names.unwrap();
+            s.extend::<HashSet<String>>(HashSet::from_iter(other_cols.into_iter()));
+            self.col_names = Some(s.into_iter().collect_vec());
+        } else {
+            for col in other_proj.col_names.as_ref().unwrap() {
+                if let Some(index) = col_names.iter().position(|value| value == col) {
+                    col_names.remove(index);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn into_updated(mut self, other_proj: ZarrProjection) -> Self {
+        self.update(other_proj);
+        self
     }
 }
 
@@ -82,7 +168,32 @@ impl ColumnProjection {
             return self.col_names.clone();
         }
     }
- }
+
+    pub(crate) fn contains(&self, to_check: &str) -> bool {
+        self.col_names.contains(&to_check.to_string())
+    }
+
+    pub(crate) fn update(mut self, other_proj: ColumnProjection) -> ColumnProjection{
+        if other_proj.skipping == self.skipping {
+            let mut s: HashSet<String> = HashSet::from_iter(self.col_names.clone().into_iter());
+            s.extend::<HashSet<String>>(HashSet::from_iter(other_proj.col_names.into_iter()));
+            self.col_names = s.into_iter().collect_vec();
+        } else {
+            for col in other_proj.col_names {
+                if let Some(index) = self.col_names.iter().position(|value| *value == col) {
+                    self.col_names.remove(index);
+                }
+            }
+        }
+
+        self
+    }
+
+    pub(crate) fn to_skip_projection(mut self) -> ColumnProjection {
+        self.skipping = true;
+        self
+    }
+}
 
 pub trait ZarrRead {
     fn get_zarr_metadata(&self) -> Result<ZarrStoreMetadata, ZarrError>;

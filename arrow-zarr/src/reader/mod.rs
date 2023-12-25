@@ -1,8 +1,10 @@
 use zarr_read::{ColumnProjection, ZarrRead, ZarrInMemoryChunk, ZarrInMemoryArray};
 use arrow_schema::{Field, FieldRef, Schema, DataType, TimeUnit};
 use metadata::{ZarrStoreMetadata, ZarrDataType,  CompressorType, Endianness, MatrixOrder, PY_UNICODE_SIZE};
+use crate::reader::filters::ZarrChunkFilter;
 use errors::{ZarrResult, ZarrError};
 use arrow_array::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 use arrow_data::ArrayData;
 use arrow_buffer::Buffer;
@@ -13,6 +15,7 @@ use itertools::Itertools;
 mod metadata;
 pub mod zarr_read;
 pub mod errors;
+pub mod filters;
 
 
 pub struct ZarrStore<T: ZarrRead> {
@@ -39,10 +42,13 @@ impl<T: ZarrRead> ZarrStore<T> {
     }
 }
 
-impl<'a, T: ZarrRead> Iterator for ZarrStore<T> {
-    type Item = ZarrResult<ZarrInMemoryChunk>;
+pub trait ZarrIterator {
+    fn next_chunk(&mut self) -> Option<ZarrResult<ZarrInMemoryChunk>>;
+    fn skip_chunk(&mut self);
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
+impl<T: ZarrRead> ZarrIterator for ZarrStore<T> {
+    fn next_chunk(&mut self) -> Option<ZarrResult<ZarrInMemoryChunk>> {
         if self.curr_chunk == self.chunk_positions.len() {
             return None;
         }
@@ -60,6 +66,11 @@ impl<'a, T: ZarrRead> Iterator for ZarrStore<T> {
         Some(chnk)
     }
 
+    fn skip_chunk(&mut self) {
+        if self.curr_chunk < self.chunk_positions.len() {
+            self.curr_chunk += 1;
+        }
+    }
 }
 
 fn build_field(t: &ZarrDataType, col_name: String) -> ZarrResult<(usize, FieldRef)> {
@@ -245,7 +256,7 @@ fn decompress_lzma(chunk_data: &[u8], output: &mut [u8]) -> Result<(), ZarrError
     Ok(())
 }
 
-fn decompress_array(
+pub(crate) fn decompress_array(
     raw_data: Vec<u8>, uncompressed_size: usize, compressor_params: Option<&CompressorType>,
 ) -> Vec<u8> {
     if let Some(comp) = compressor_params {
@@ -285,7 +296,18 @@ fn get_3d_dim_order(order: &MatrixOrder) -> [usize; 3] {
     }
 }
 
-fn process_edge_chunk(
+pub(crate) fn move_indices_to_front(buf: &mut [u8], indices: &Vec<usize>, data_size: usize) {
+    let mut output_idx = 0;
+    for data_idx in indices {
+        buf.copy_within(
+            data_idx * data_size..(data_idx + 1) * data_size,
+            output_idx * data_size
+        );
+        output_idx += 1;
+    }
+}
+
+pub(crate) fn process_edge_chunk(
     buf: &mut [u8],
     chunk_dims: &Vec<usize>,
     real_dims: &Vec<usize>,
@@ -319,40 +341,40 @@ fn process_edge_chunk(
         _ => {panic!("Edge chunk with more than 3 domensions, 3 is the limit")}
     };
 
-    let mut output_idx = 0;
-    for data_idx in indices_to_keep {
-        buf.copy_within(
-            data_idx * data_size..(data_idx + 1) * data_size,
-            output_idx * data_size
-        );
-        output_idx += 1;
-    }
+   move_indices_to_front(buf, &indices_to_keep, data_size);
 }
 
-pub struct ZarrRecordBatchReader<T> 
-where 
-    T: Iterator<Item = ZarrResult<ZarrInMemoryChunk>>
+pub struct ZarrRecordBatchReader<T: ZarrIterator> 
 {
     meta: ZarrStoreMetadata,
     zarr_store: T,
+    projection: Option<ColumnProjection>,
+    filter: Option<ZarrChunkFilter>,
+    predicate_projection_store: Option<T>,
 }
 
-impl<T> ZarrRecordBatchReader<T>
-where 
-    T: Iterator<Item = ZarrResult<ZarrInMemoryChunk>>
+impl<T: ZarrIterator> ZarrRecordBatchReader<T>
 {
-    pub(crate) fn new(meta: ZarrStoreMetadata, zarr_store: T) -> Self {
-        Self {meta, zarr_store}
+    pub(crate) fn new(
+        meta: ZarrStoreMetadata,
+        zarr_store: T,
+        projection: Option<ColumnProjection>,
+        filter: Option<ZarrChunkFilter>,
+        predicate_projection_store: Option<T>
+    ) -> Self {
+        Self {meta, zarr_store, projection, filter, predicate_projection_store}
     }
 
-    pub(crate) fn unpack_chunk(&self, mut chunk: ZarrInMemoryChunk) -> ZarrResult<RecordBatch> {
+    pub(crate) fn unpack_chunk(
+        &self, mut chunk: ZarrInMemoryChunk, final_indices: Option<&Vec<usize>>
+    ) -> ZarrResult<RecordBatch> {
         let mut arrs: Vec<ArrayRef> = Vec::with_capacity(self.meta.get_num_columns());
         let mut fields: Vec<FieldRef> = Vec::with_capacity(self.meta.get_num_columns());
 
         for col in chunk.get_cols_in_chunk() {
-            let data = chunk.get_array_data(&col)?;
+            let data = chunk.take_array(&col)?;
             let (arr, field) = self.unpack_array_chunk(
-                col.to_string(), data, chunk.get_real_dims(), self.meta.get_chunk_dims()
+                col.to_string(), data, chunk.get_real_dims(), self.meta.get_chunk_dims(), final_indices
             )?;
             arrs.push(arr);
             fields.push(field);
@@ -367,6 +389,7 @@ where
         arr_chnk: ZarrInMemoryArray,
         real_dims: &Vec<usize>,
         chunk_dims: &Vec<usize>,
+        final_indices: Option<&Vec<usize>>,
     ) -> ZarrResult<(ArrayRef, FieldRef)> {
             // get the metadata for the array
             let meta = self.meta.get_array_meta(&col_name)?;
@@ -402,19 +425,25 @@ where
             // create the array
             let real_size = real_dims.iter().fold(1, |mult, x| mult * x) * data_size;
             data.resize(real_size, 0);
+
+            // select the final indices in the data
+            if let Some(final_indices) = final_indices {
+                move_indices_to_front(&mut data, final_indices, data_size);
+                data.resize(final_indices.len() * data_size, 0);
+            }
+
             let arr = build_array(data, field.data_type(), data_size)?;
 
             Ok((arr, field))
     }
 }
 
-impl<T> Iterator for ZarrRecordBatchReader<T>
-where
-T: Iterator<Item = ZarrResult<ZarrInMemoryChunk>>
+impl<T: ZarrIterator> Iterator for ZarrRecordBatchReader<T>
 {
     type Item = ZarrResult<RecordBatch>;
+    /* 
     fn next(&mut self) -> Option<Self::Item> {
-        let next_batch = self.zarr_store.next();
+        let next_batch = self.zarr_store.next_chunk();
         if next_batch.is_none() {
             return None
         }
@@ -423,9 +452,97 @@ T: Iterator<Item = ZarrResult<ZarrInMemoryChunk>>
         if let Err(err) = next_batch {
             return Some(Err(err));
         }
-
+        
         let next_batch = next_batch.unwrap();
-        return Some(self.unpack_chunk(next_batch));
+        return Some(self.unpack_chunk(next_batch, None));
+    }
+    */
+    fn next(&mut self) -> Option<Self::Item> {
+        // handle filters first
+        let mut bool_arr: Option<BooleanArray> = None;
+        let mut raw_data_to_add: HashMap<String, Vec<u8>> = HashMap::new();
+        if let Some(store) = self.predicate_projection_store.as_mut() {
+            let predicate_proj_chunk = store.next_chunk();
+            if predicate_proj_chunk.is_none() {
+                return None
+            }
+
+            let predicate_proj_chunk = predicate_proj_chunk.unwrap();
+            if let Err(err) = predicate_proj_chunk {
+                return Some(Err(err));
+            }
+            let predicate_proj_chunk = predicate_proj_chunk.unwrap();
+
+            for col in predicate_proj_chunk.get_cols_in_chunk() {
+                if self.projection.as_ref().unwrap().contains(&col) {
+                    let data = predicate_proj_chunk.copy_array(&col);
+                    if let Err(err) = data {
+                        return Some(Err(err));
+                    }
+                    let data = data.unwrap();
+                    raw_data_to_add.insert(col.to_string(), data.take_data());
+                }
+            }
+
+            let predicate_rec = self.unpack_chunk(predicate_proj_chunk, None);
+            if let Err(err) = predicate_rec {
+                return Some(Err(err));
+            }
+            let predicate_rec = predicate_rec.unwrap();
+            
+            if let Some(filter) = self.filter.as_mut() {
+                for predicate in filter.predicates.iter_mut() {
+                    let mask = predicate.evaluate(&predicate_rec);
+                    if let Err(err) = mask {
+                        return Some(Err(ZarrError::from(err)));
+                    }
+
+                    let mask = mask.unwrap();
+                    if let Some(old_bool_arr) = bool_arr {
+                        bool_arr = Some(BooleanArray::from(
+                            old_bool_arr
+                                .iter()
+                                .zip(mask.iter())
+                                .map(|(x, y)| x.unwrap() && y.unwrap())
+                                .collect_vec()
+                        ));
+                    } else {
+                        bool_arr = Some(mask);
+                    }
+
+                    if bool_arr.as_ref().unwrap().true_count() == 0 {
+                        self.zarr_store.skip_chunk();
+                        return self.next();
+                    }
+                }
+            }
+            else {
+                return Some(Err(ZarrError::InvalidPredicate("no filters found".to_string())))
+            }
+            
+        }
+
+         // main logic for the chunk
+         let next_batch = self.zarr_store.next_chunk();
+         if next_batch.is_none() {
+             return None
+         }
+ 
+         let next_batch = next_batch.unwrap();
+         if let Err(err) = next_batch {
+             return Some(Err(err));
+         }
+         let mut next_batch = next_batch.unwrap();
+         for (col, data) in raw_data_to_add.into_iter() {
+             next_batch.add_array(col.to_string(), data);
+         }
+ 
+         let mut final_indices: Option<Vec<usize>> = None;
+         if let Some(mask) = bool_arr {
+             let mask = mask.values();
+             final_indices = Some(mask.iter().enumerate().filter(|x| x.1).map(|x| x.0).collect());
+         }
+         return Some(self.unpack_chunk(next_batch, final_indices.as_ref()));
     }
 }
 
@@ -433,25 +550,47 @@ pub struct ZarrRecordBatchReaderBuilder<T: ZarrRead + Clone>
 {
     zarr_reader: T,
     projection: Option<ColumnProjection>,
+    filter: Option<ZarrChunkFilter>,
 }
 
 impl<T: ZarrRead + Clone> ZarrRecordBatchReaderBuilder<T> {
     pub fn new(zarr_reader: T) -> Self {
-        Self{zarr_reader, projection: None}
+        Self{zarr_reader, projection: None, filter: None}
     }
 
     pub fn with_projection(self, projection: ColumnProjection) -> Self {
         Self {projection: Some(projection), ..self}
     }
 
-    pub fn build(self) -> ZarrResult<ZarrRecordBatchReader<ZarrStore<T>>> {
-        let meta = self.zarr_reader.get_zarr_metadata()?;
-        let chunk_pos: Vec<Vec<usize>> = meta.get_chunk_positions();
-        let zarr_store = ZarrStore::new(self.zarr_reader, chunk_pos, self.projection.clone())?;
-        
-        Ok(ZarrRecordBatchReader::new(meta, zarr_store))
+    pub fn with_filter(self, filter: ZarrChunkFilter) -> Self {
+        Self {filter: Some(filter), ..self}
     }
 
+    pub fn build(mut self) -> ZarrResult<ZarrRecordBatchReader<ZarrStore<T>>> {
+        let meta = self.zarr_reader.get_zarr_metadata()?;
+        let chunk_pos: Vec<Vec<usize>> = meta.get_chunk_positions();
+
+        let zarr_store: ZarrStore<T>;
+        let mut predicate_store: Option<ZarrStore<T>> = None;
+        if let Some(filter) = &self.filter {
+            let predicate_proj = filter.get_all_projections();
+            predicate_store = Some(ZarrStore::new(self.zarr_reader.clone(), chunk_pos.clone(), Some(predicate_proj.clone()))?);
+
+            if self.projection.is_none() {
+                self.projection = Some(ColumnProjection::new(false, meta.get_columns().clone()));
+            }
+            let mut store_proj = self.projection.clone();
+            store_proj = Some(store_proj.unwrap().update(predicate_proj.to_skip_projection()));
+            zarr_store = ZarrStore::new(self.zarr_reader, chunk_pos, store_proj)?;
+        }
+        else {
+            zarr_store = ZarrStore::new(self.zarr_reader, chunk_pos, self.projection.clone())?;
+        }
+        
+        Ok(ZarrRecordBatchReader::new(meta, zarr_store, self.projection, self.filter, predicate_store))
+    }
+
+    /*
     pub fn build_multiple(self, n_readers: usize) -> ZarrResult<Vec<ZarrRecordBatchReader<ZarrStore<T>>>> {
         let meta = self.zarr_reader.get_zarr_metadata()?;
         let chunk_pos: Vec<Vec<usize>> = meta.get_chunk_positions();
@@ -461,12 +600,13 @@ impl<T: ZarrRead + Clone> ZarrRecordBatchReaderBuilder<T> {
                 let store = ZarrStore::new(
                     self.zarr_reader.clone(), chnk_positions.to_vec(), self.projection.clone()
                 ).unwrap();
-                ZarrRecordBatchReader::new(meta.clone(), store)
+                ZarrRecordBatchReader::new(meta.clone(), store, self.projection.clone())
             }
         ).collect();
 
         Ok(readers)
     }
+    */  
 }
 
 #[cfg(test)]
@@ -475,9 +615,10 @@ mod zarr_reader_tests {
     use arrow_array::types::*;
     use arrow_schema::{DataType, TimeUnit};
     use itertools::enumerate;
+    use crate::reader::filters::{ZarrArrowPredicateFn, ZarrArrowPredicate};
 
     use super::*;
-    use std::{path::PathBuf, collections::HashMap, fmt::Debug};
+    use std::{path::PathBuf, collections::HashMap, fmt::Debug, boxed::Box};
 
     fn get_test_data_path(zarr_store: String) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testing/data/zarr").join(zarr_store)
@@ -620,6 +761,7 @@ mod zarr_reader_tests {
 
     }
 
+    /*
     #[test]
     fn multiple_readers_tests() {
         let p = get_test_data_path("compression_example.zarr".to_string());
@@ -667,6 +809,7 @@ mod zarr_reader_tests {
             &"float_data_no_comp", rec, &[251.0, 252.0, 253.0, 259.0, 260.0, 261.0]
         );
     }
+    */
 
     #[test]
     fn endianness_and_order_tests() {
@@ -819,5 +962,86 @@ mod zarr_reader_tests {
         validate_names_and_types(&target_types, rec);
         validate_primitive_column::<Int64Type, i64>(&"int_data", rec, &[62]);
         validate_primitive_column::<Float64Type, f64>(&"float_data", rec, &[224.0]);
+    }
+
+    use arrow::compute::kernels::cmp::{gt_eq, lt};
+    #[test]
+    fn test_filters() {
+        let p = get_test_data_path("lat_lon_example.zarr".to_string());
+        let mut builder = ZarrRecordBatchReaderBuilder::new(p);
+
+        // set the filters to select part of the raster, based on lat and
+        // lon coordinates.
+        let mut filters: Vec<Box<dyn ZarrArrowPredicate>> = Vec::new();
+        let f = ZarrArrowPredicateFn::new(
+            ColumnProjection::new(false, vec!["lat".to_string()]),
+            move |batch| (
+                gt_eq(batch.column_by_name("lat").unwrap(), &Scalar::new(&Float64Array::from(vec![38.6])))
+            ),
+        );
+        filters.push(Box::new(f));
+        let f = ZarrArrowPredicateFn::new(
+            ColumnProjection::new(false, vec!["lon".to_string()]),
+            move |batch| (
+                gt_eq(batch.column_by_name("lon").unwrap(), &Scalar::new(&Float64Array::from(vec![-109.7])))
+            ),
+        );
+        filters.push(Box::new(f));
+        let f = ZarrArrowPredicateFn::new(
+            ColumnProjection::new(false, vec!["lon".to_string()]),
+            move |batch| (
+                lt(batch.column_by_name("lon").unwrap(), &Scalar::new(&Float64Array::from(vec![-109.2])))
+            ),
+        );
+        filters.push(Box::new(f));
+
+        // build the reader with the filters
+        builder = builder.with_filter(ZarrChunkFilter::new(filters));
+        let reader = builder.build().unwrap();
+        let records: Vec<RecordBatch> = reader.map(|x| x.unwrap()).collect();
+
+        // check the 4 chunks that have some in the specified lat/lon range
+        // center chunk
+        let target_types = HashMap::from([
+            ("lat".to_string(), DataType::Float64),
+            ("lon".to_string(), DataType::Float64),
+            ("float_data".to_string(), DataType::Float64),
+        ]);
+
+        let rec = &records[0];
+        validate_names_and_types(&target_types, rec);
+        validate_primitive_column::<Float64Type, f64>(&"lat", rec, &[38.6, 38.7]);
+        validate_primitive_column::<Float64Type, f64>(&"lon", rec, &[-109.7, -109.7]);
+        validate_primitive_column::<Float64Type, f64>(&"float_data", rec, &[1040.0, 1041.0]);
+
+        let rec = &records[1];
+        validate_names_and_types(&target_types, rec);
+        validate_primitive_column::<Float64Type, f64>(&"lat", rec, &[38.8, 38.9, 39.0]);
+        validate_primitive_column::<Float64Type, f64>(&"lon", rec, &[-109.7, -109.7, -109.7]);
+        validate_primitive_column::<Float64Type, f64>(&"float_data", rec, &[1042.0, 1043.0, 1044.0]);
+
+        let rec = &records[2];
+        validate_names_and_types(&target_types, rec);
+        validate_primitive_column::<Float64Type, f64>(
+            &"lat", rec, &[38.6, 38.7, 38.6, 38.7, 38.6, 38.7, 38.6, 38.7]
+        );
+        validate_primitive_column::<Float64Type, f64>(
+            &"lon", rec, &[-109.6, -109.6, -109.5, -109.5, -109.4, -109.4, -109.3, -109.3]
+        );
+        validate_primitive_column::<Float64Type, f64>(
+            &"float_data", rec, &[1051.0, 1052.0, 1062.0, 1063.0, 1073.0, 1074.0, 1084.0, 1085.0]
+        );
+
+        let rec = &records[3];
+        validate_names_and_types(&target_types, rec);
+        validate_primitive_column::<Float64Type, f64>(
+            &"lat", rec, &[38.8, 38.9, 39.0, 38.8, 38.9, 39.0, 38.8, 38.9, 39.0, 38.8, 38.9, 39.0]
+        );
+        validate_primitive_column::<Float64Type, f64>(
+            &"lon", rec, &[-109.6, -109.6, -109.6, -109.5, -109.5, -109.5, -109.4, -109.4, -109.4, -109.3, -109.3, -109.3]
+        );
+        validate_primitive_column::<Float64Type, f64>(
+            &"float_data", rec, &[1053.0, 1054.0, 1055.0, 1064.0, 1065.0, 1066.0, 1075.0, 1076.0, 1077.0, 1086.0, 1087.0, 1088.0]
+        );
     }
 }
