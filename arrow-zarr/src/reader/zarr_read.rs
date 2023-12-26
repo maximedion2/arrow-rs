@@ -58,12 +58,6 @@ impl ZarrInMemoryChunk {
     pub(crate) fn take_array(&mut self, col: &str) -> ZarrResult<ZarrInMemoryArray> {
         self.data.remove(col).ok_or(ZarrError::MissingArray(col.to_string()))
     }
-
-    pub(crate) fn copy_array(&self, col: &str) -> ZarrResult<ZarrInMemoryArray> {
-        Ok(
-            self.data.get(col).ok_or(ZarrError::MissingArray(col.to_string()))?.clone()
-        )
-    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -73,6 +67,8 @@ pub(crate) enum ProjectionType {
     Null, 
 }
 
+/// A structure to handle skipping or selecting specific columns (zarr arrays) from
+/// a zarr store. 
 #[derive(Clone)]
 pub struct ZarrProjection {
     projection_type: ProjectionType,
@@ -80,14 +76,17 @@ pub struct ZarrProjection {
 }
 
 impl ZarrProjection {
+    /// Create a projection that keeps all columns.
     pub fn all() -> Self {
         Self{projection_type: ProjectionType::Null, col_names: None}
     }
 
+    /// Create a projection that skips certain columns (and keeps all the other columns).
     pub fn skip(col_names: Vec<String>) -> Self {
         Self{projection_type: ProjectionType::Skip, col_names: Some(col_names)}
     }
 
+    /// Create a projection that keeps certain columns (and skips all the other columns).
     pub fn keep(col_names: Vec<String>) -> Self {
         Self { projection_type: ProjectionType::Select, col_names: Some(col_names)}
     }
@@ -103,9 +102,11 @@ impl ZarrProjection {
             },
             ProjectionType::Select => {
                 let col_names = self.col_names.as_ref().unwrap();
-                for col in all_cols {
-                    if !col_names.contains(&col) {
-                        return Err(ZarrError::MissingArray("Column in selection missing columns to select from".to_string()))
+                for col in col_names {
+                    if !all_cols.contains(&col) {
+                        return Err(
+                            ZarrError::MissingArray("Column in projection missing columns to select from".to_string())
+                        )
                     }
                 }
                 return Ok(col_names.clone())
@@ -127,7 +128,6 @@ impl ZarrProjection {
         let col_names = self.col_names.as_mut().unwrap();
         if other_proj.projection_type == self.projection_type {
             let mut s: HashSet<String> = HashSet::from_iter(col_names.clone().into_iter());
-
             let other_cols = other_proj.col_names.unwrap();
             s.extend::<HashSet<String>>(HashSet::from_iter(other_cols.into_iter()));
             self.col_names = Some(s.into_iter().collect_vec());
@@ -139,64 +139,15 @@ impl ZarrProjection {
             }
         }
     }
-
-    pub(crate) fn into_updated(mut self, other_proj: ZarrProjection) -> Self {
-        self.update(other_proj);
-        self
-    }
 }
 
-#[derive(Clone)]
-pub struct ColumnProjection {
-    skipping: bool,
-    col_names: Vec<String>,
-}
-
-impl ColumnProjection {
-    pub fn new(skipping: bool, col_names: Vec<String>) -> Self {
-        Self {skipping, col_names}
-    }
-
-    pub(crate) fn get_cols_to_read(&self, all_cols: &Vec<String>) -> Vec<String> {
-        if self.skipping {
-            return all_cols.iter()
-                           .filter(|x| !self.col_names
-                           .contains(x))
-                           .map(|x| x.to_string())
-                           .collect();
-        } else {
-            return self.col_names.clone();
-        }
-    }
-
-    pub(crate) fn contains(&self, to_check: &str) -> bool {
-        self.col_names.contains(&to_check.to_string())
-    }
-
-    pub(crate) fn update(mut self, other_proj: ColumnProjection) -> ColumnProjection{
-        if other_proj.skipping == self.skipping {
-            let mut s: HashSet<String> = HashSet::from_iter(self.col_names.clone().into_iter());
-            s.extend::<HashSet<String>>(HashSet::from_iter(other_proj.col_names.into_iter()));
-            self.col_names = s.into_iter().collect_vec();
-        } else {
-            for col in other_proj.col_names {
-                if let Some(index) = self.col_names.iter().position(|value| *value == col) {
-                    self.col_names.remove(index);
-                }
-            }
-        }
-
-        self
-    }
-
-    pub(crate) fn to_skip_projection(mut self) -> ColumnProjection {
-        self.skipping = true;
-        self
-    }
-}
-
+/// A trait that exposes methods to get data from a zarr store.
 pub trait ZarrRead {
+    /// Method to retrieve the metadata from a zarr store.
     fn get_zarr_metadata(&self) -> Result<ZarrStoreMetadata, ZarrError>;
+    
+    /// Method to retrive the data in a zarr chunk, which is really the data
+    /// contained into one or more chunk files, one per zarr array in the store.
     fn get_zarr_chunk(
         &self,
         position: &Vec<usize>,
@@ -205,6 +156,8 @@ pub trait ZarrRead {
     ) -> Result<ZarrInMemoryChunk, ZarrError>;
 }
 
+/// Implementation of the [`ZarrRead`] trait for a path buffer which contains the
+/// path to a zarr store.
 impl ZarrRead for PathBuf {
     fn get_zarr_metadata(&self) -> Result<ZarrStoreMetadata, ZarrError> {
         let mut meta = ZarrStoreMetadata::new();
@@ -311,14 +264,14 @@ mod zarr_read_tests {
         );
 
         // test selecting only one of the 2 columns
-        let col_proj = ColumnProjection::new(true, vec!["float_data".to_string()]);
-        let cols = col_proj.get_cols_to_read(meta.get_columns());
+        let col_proj = ZarrProjection::skip(vec!["float_data".to_string()]);
+        let cols = col_proj.apply_selection(meta.get_columns()).unwrap();
         let chunk = p.get_zarr_chunk(&pos, &cols, meta.get_real_dims(&pos)).unwrap();
         assert_eq!(chunk.data.keys().collect::<Vec<&String>>(), vec!["byte_data"]);
 
         // same as above, but specify columsn to keep instead of to skip
-        let col_proj = ColumnProjection::new(false, vec!["float_data".to_string()]);
-        let cols = col_proj.get_cols_to_read(meta.get_columns());
+        let col_proj = ZarrProjection::keep(vec!["float_data".to_string()]);
+        let cols = col_proj.apply_selection(meta.get_columns()).unwrap();
         let chunk = p.get_zarr_chunk(
             &pos, &cols, meta.get_real_dims(&pos)).unwrap();
         assert_eq!(chunk.data.keys().collect::<Vec<&String>>(), vec!["float_data"]);

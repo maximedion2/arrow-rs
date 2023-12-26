@@ -45,7 +45,7 @@ enum Filter {
 
 
 /// The metadata for a single zarr array, which holds various parameters
-/// for the data store in the array.
+/// for the data stored in the array.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ZarrArrayMetadata {
     zarr_format: u8,
@@ -85,7 +85,7 @@ impl ZarrArrayMetadata {
 }
 
 /// The metadata for a zarr store made up of one or more zarr arrays,
-/// holding the array metadata for all of the arrays and the parameters
+/// holding the metadata for all of the arrays and the parameters
 /// that have to be consistent across all the arrays.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ZarrStoreMetadata {

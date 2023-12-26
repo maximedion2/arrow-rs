@@ -9,6 +9,7 @@ pub enum ZarrError {
     InvalidPredicate(String),
     MissingChunk(Vec<usize>),
     MissingArray(String),
+    InvalidChunkRange(usize, usize, usize),
     Io(Box<dyn Error + Send + Sync>),
     Arrow(Box<dyn Error + Send + Sync>)
 }
@@ -24,6 +25,9 @@ impl std::fmt::Display for ZarrError {
                 write!(fmt, "Missing zarr chunk file: {s}")
             },
             ZarrError::MissingArray(arr_name) => write!(fmt, "Missing zarr chunk file: {arr_name}"),
+            ZarrError::InvalidChunkRange(start, end, l) => {
+                write!(fmt, "Invalid chunk range {start}, {end} with store on length {l}")
+            },
             ZarrError::Io(e) => write!(fmt, "IO error: {e}"),
             ZarrError::Arrow(e) => write!(fmt, "Arrow error: {e}"),
         }
