@@ -1,10 +1,10 @@
 use crate::reader::zarr_read::ZarrProjection;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::ArrowError;
-
+use dyn_clone::{DynClone, clone_trait_object};
 
 /// A predicate operating on [`RecordBatch`]
-pub trait ZarrArrowPredicate: Send + 'static {
+pub trait ZarrArrowPredicate: Send + DynClone + 'static {
     /// Returns the [`ZarrProjecction`] that describes the columns required
     /// to evaluate this predicate. Those must be present in record batches
     /// that aare passed into the [`evaluate`] method.
@@ -16,9 +16,11 @@ pub trait ZarrArrowPredicate: Send + 'static {
     /// The method should not return any `Null` values.
     fn evaluate(&mut self, batch: &RecordBatch) -> Result<BooleanArray, ArrowError>;
 }
+clone_trait_object!(ZarrArrowPredicate);
 
 
 /// A [`ZarrArrowPredicate`] created from an [`FnMut`]
+#[derive(Clone)]
 pub struct ZarrArrowPredicateFn<F> {
     f: F,
     projection: ZarrProjection,
@@ -35,7 +37,7 @@ where
 
 impl<F> ZarrArrowPredicate for ZarrArrowPredicateFn<F>
 where
-    F: FnMut(&RecordBatch) -> Result<BooleanArray, ArrowError> + Send + 'static,
+    F: FnMut(&RecordBatch) -> Result<BooleanArray, ArrowError> + Send + Clone + 'static,
 {
     fn projection(&self) -> &ZarrProjection {
         &self.projection
@@ -47,7 +49,8 @@ where
 }
 
 
-/// A collection of one or more objects that implement [`ZarrArrowPredicate`].
+/// A collection of one or more objects that implement [`ZarrArrowPredicate`]
+#[derive(Clone)]
 pub struct ZarrChunkFilter {
     /// A list of [`ZarrArrowPredicate`]
     pub(crate) predicates: Vec<Box<dyn ZarrArrowPredicate>>,

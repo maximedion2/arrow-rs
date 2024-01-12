@@ -1,7 +1,7 @@
 use zarr_read::{ZarrProjection, ZarrRead, ZarrInMemoryChunk, ZarrInMemoryArray};
 use arrow_schema::{Field, FieldRef, Schema, DataType, TimeUnit};
 use metadata::{ZarrStoreMetadata, ZarrDataType,  CompressorType, Endianness, MatrixOrder, PY_UNICODE_SIZE};
-use crate::reader::filters::ZarrChunkFilter;
+use filters::ZarrChunkFilter;
 use errors::{ZarrResult, ZarrError};
 use arrow_array::*;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use arrow_buffer::ToByteSlice;
 use std::io::Read;
 use itertools::Itertools;
 
-mod metadata;
+pub mod metadata;
 pub mod zarr_read;
 pub mod errors;
 pub mod filters;
@@ -57,6 +57,7 @@ macro_rules! unwrap_or_return {
         }
     }
 }
+pub(crate) use unwrap_or_return;
 
 impl<T: ZarrRead> ZarrIterator for ZarrStore<T> {
     /// Get the data from the next zarr chunk.
@@ -360,20 +361,25 @@ pub(crate) fn process_edge_chunk(
 pub struct ZarrRecordBatchReader<T: ZarrIterator> 
 {
     meta: ZarrStoreMetadata,
-    zarr_store: T,
+    zarr_store: Option<T>,
     filter: Option<ZarrChunkFilter>,
     predicate_projection_store: Option<T>,
+    row_mask: Option<BooleanArray>,
 }
 
 impl<T: ZarrIterator> ZarrRecordBatchReader<T>
 {
     pub(crate) fn new(
         meta: ZarrStoreMetadata,
-        zarr_store: T,
+        zarr_store: Option<T>,
         filter: Option<ZarrChunkFilter>,
         predicate_projection_store: Option<T>
     ) -> Self {
-        Self {meta, zarr_store, filter, predicate_projection_store}
+        Self {meta, zarr_store, filter, predicate_projection_store, row_mask: None}
+    }
+
+    pub(crate) fn with_row_mask(self, row_mask: BooleanArray) -> Self {
+        Self {row_mask: Some(row_mask), ..self}
     }
 
     pub(crate) fn unpack_chunk(
@@ -455,7 +461,7 @@ impl<T: ZarrIterator> Iterator for ZarrRecordBatchReader<T>
 
     fn next(&mut self) -> Option<Self::Item> {
         // handle filters first. 
-        let mut bool_arr: Option<BooleanArray> = None;
+        let mut bool_arr: Option<BooleanArray> = self.row_mask.clone();
         if let Some(store) = self.predicate_projection_store.as_mut() {
             let predicate_proj_chunk = store.next_chunk();
             if predicate_proj_chunk.is_none() {
@@ -482,14 +488,28 @@ impl<T: ZarrIterator> Iterator for ZarrRecordBatchReader<T>
                     } else {
                         bool_arr = Some(mask);
                     }
+                }
 
-                    // this is the case where we've determined that now row in the chunk will
-                    // satisfy the filer condition(s), so we skip the chunk and move on to 
-                    // the next one by calling next().
-                    if bool_arr.as_ref().unwrap().true_count() == 0 {
-                        self.zarr_store.skip_chunk();
-                        return self.next();
-                    }
+                // if there is no store provided, other than the one to evaluate the 
+                // predicates, then this call to next is only meant to evaluate the predicate
+                // by itself, and we return a record batch for the results.
+                if self.zarr_store.is_none() {
+                    let rec = RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![Field::new("mask", DataType::Boolean, false)])),
+                        vec![Arc::new(bool_arr.unwrap())]
+                    );
+                    let rec = unwrap_or_return!(rec);
+                    return Some(Ok(rec));
+                }
+
+                // this is the case where we've determined that no row in the chunk will
+                // satisfy the filer condition(s), so we skip the chunk and move on to 
+                // the next one by calling next().
+                if bool_arr.as_ref().unwrap().true_count() == 0 {
+                    // since we checked above that self.zarr_store is not None, we can simply
+                    // unwrap it here.
+                    self.zarr_store.as_mut().unwrap().skip_chunk();
+                    return self.next();
                 }
             }
             else {
@@ -498,8 +518,16 @@ impl<T: ZarrIterator> Iterator for ZarrRecordBatchReader<T>
             
         }
 
+        if self.zarr_store.is_none() {
+            return Some(
+                Err(
+                    ZarrError::MissingArray("No zarr store provided in zarr record batch reader".to_string())
+                )
+            );
+        }
+
          // main logic for the chunk
-         let next_batch = self.zarr_store.next_chunk();
+         let next_batch = self.zarr_store.as_mut().unwrap().next_chunk();
          if next_batch.is_none() {
              return None
          }
@@ -557,7 +585,7 @@ impl<T: ZarrRead + Clone> ZarrRecordBatchReaderBuilder<T> {
         }
 
         let zarr_store = ZarrStore::new(self.zarr_reader, chunk_pos, self.projection.clone())?;
-        Ok(ZarrRecordBatchReader::new(meta, zarr_store, self.filter, predicate_store))
+        Ok(ZarrRecordBatchReader::new(meta, Some(zarr_store), self.filter, predicate_store))
     }
 
     pub fn build(self) -> ZarrResult<ZarrRecordBatchReader<ZarrStore<T>>> {
@@ -572,7 +600,7 @@ mod zarr_reader_tests {
     use arrow_schema::{DataType, TimeUnit};
     use itertools::enumerate;
     use crate::reader::filters::{ZarrArrowPredicateFn, ZarrArrowPredicate};
-
+    use arrow::compute::kernels::cmp::{gt_eq, lt};
     use super::*;
     use std::{path::PathBuf, collections::HashMap, fmt::Debug, boxed::Box};
 
@@ -719,7 +747,6 @@ mod zarr_reader_tests {
     #[test]
     fn multiple_readers_tests() {
         let p = get_test_data_path("compression_example.zarr".to_string());
-        //let mut readers = ZarrRecordBatchReaderBuilder::new(p).build_multiple(2).unwrap();
         let reader1 = ZarrRecordBatchReaderBuilder::new(p.clone()).build_partial_reader(Some((0, 5))).unwrap();
         let reader2 = ZarrRecordBatchReaderBuilder::new(p).build_partial_reader(Some((5, 9))).unwrap();
 
@@ -917,9 +944,8 @@ mod zarr_reader_tests {
         validate_primitive_column::<Float64Type, f64>(&"float_data", rec, &[224.0]);
     }
 
-    use arrow::compute::kernels::cmp::{gt_eq, lt};
     #[test]
-    fn test_filters() {
+    fn filters_tests() {
         let p = get_test_data_path("lat_lon_example.zarr".to_string());
         let mut builder = ZarrRecordBatchReaderBuilder::new(p);
 

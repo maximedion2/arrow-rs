@@ -2,6 +2,8 @@ use std::error::Error;
 use std::io;
 use std::result::Result;
 use arrow_schema::ArrowError;
+use object_store::Error as ObjStoreError;
+use std::str::Utf8Error;
 
 #[derive(Debug)]
 pub enum ZarrError {
@@ -11,7 +13,8 @@ pub enum ZarrError {
     MissingArray(String),
     InvalidChunkRange(usize, usize, usize),
     Io(Box<dyn Error + Send + Sync>),
-    Arrow(Box<dyn Error + Send + Sync>)
+    Arrow(Box<dyn Error + Send + Sync>),
+    ObjectStore(Box<dyn Error + Send + Sync>),
 }
 
 impl std::fmt::Display for ZarrError {
@@ -30,6 +33,7 @@ impl std::fmt::Display for ZarrError {
             },
             ZarrError::Io(e) => write!(fmt, "IO error: {e}"),
             ZarrError::Arrow(e) => write!(fmt, "Arrow error: {e}"),
+            ZarrError::ObjectStore(e) => write!(fmt, "Arrow error: {e}"),
         }
     }
 }
@@ -43,6 +47,18 @@ impl From<io::Error> for ZarrError {
 impl From<ArrowError> for ZarrError {
     fn from(e: ArrowError) -> ZarrError {
         ZarrError::Arrow(Box::new(e))
+    }
+}
+
+impl From<ObjStoreError> for ZarrError {
+    fn from(e: ObjStoreError) -> ZarrError {
+        ZarrError::ObjectStore(Box::new(e))
+    }
+}
+
+impl From<Utf8Error> for ZarrError {
+    fn from(e: Utf8Error) -> ZarrError {
+        ZarrError::InvalidMetadata(e.to_string())
     }
 }
 

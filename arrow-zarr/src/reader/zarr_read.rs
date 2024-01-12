@@ -3,14 +3,13 @@ use crate::reader::metadata::ZarrStoreMetadata;
 use std::collections::{HashMap, HashSet};
 use std::fs::{read_to_string, read};
 use std::path::PathBuf;
-use crate::reader::errors::ZarrError;
-use super::errors::ZarrResult;
+use crate::reader::errors::{ZarrError, ZarrResult};
 
 /// An in-memory representation of the data contained in one chunk
 /// of one zarr array. 
 #[derive(Debug, Clone)]
 pub struct ZarrInMemoryArray {
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 impl ZarrInMemoryArray {
@@ -25,14 +24,14 @@ impl ZarrInMemoryArray {
 
 /// An in-memory representation of the data contained in one chunk
 /// of one whole zarr store with one or more zarr arrays. 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ZarrInMemoryChunk {
-    data: HashMap<String, ZarrInMemoryArray>,
+    pub(crate) data: HashMap<String, ZarrInMemoryArray>,
     real_dims: Vec<usize>,
 }
 
 impl ZarrInMemoryChunk {
-    fn new(real_dims: Vec<usize>) -> Self {
+    pub(crate) fn new(real_dims: Vec<usize>) -> Self {
         Self {
             data: HashMap::new(),
             real_dims: real_dims,
@@ -144,7 +143,7 @@ impl ZarrProjection {
 /// A trait that exposes methods to get data from a zarr store.
 pub trait ZarrRead {
     /// Method to retrieve the metadata from a zarr store.
-    fn get_zarr_metadata(&self) -> Result<ZarrStoreMetadata, ZarrError>;
+    fn get_zarr_metadata(&self) -> ZarrResult<ZarrStoreMetadata>;
     
     /// Method to retrive the data in a zarr chunk, which is really the data
     /// contained into one or more chunk files, one per zarr array in the store.
@@ -153,13 +152,13 @@ pub trait ZarrRead {
         position: &Vec<usize>,
         cols: &Vec<String>,
         real_dims: Vec<usize>,
-    ) -> Result<ZarrInMemoryChunk, ZarrError>;
+    ) -> ZarrResult<ZarrInMemoryChunk>;
 }
 
 /// Implementation of the [`ZarrRead`] trait for a path buffer which contains the
 /// path to a zarr store.
 impl ZarrRead for PathBuf {
-    fn get_zarr_metadata(&self) -> Result<ZarrStoreMetadata, ZarrError> {
+    fn get_zarr_metadata(&self) -> ZarrResult<ZarrStoreMetadata> {
         let mut meta = ZarrStoreMetadata::new();
         let dir = self.read_dir().unwrap();
 
@@ -186,7 +185,7 @@ impl ZarrRead for PathBuf {
         position: &Vec<usize>,
         cols: &Vec<String>,
         real_dims: Vec<usize>,
-    ) -> Result<ZarrInMemoryChunk, ZarrError> {
+    ) -> ZarrResult<ZarrInMemoryChunk> {
         let mut chunk = ZarrInMemoryChunk::new(real_dims);
         for var in cols {
             let s: Vec<String> = position.into_iter().map(|i| i.to_string()).collect();
@@ -210,7 +209,6 @@ mod zarr_read_tests {
     use crate::reader::metadata::{ZarrDataType, MatrixOrder, Endianness, ZarrArrayMetadata};
     use std::path::PathBuf;
     use std::collections::HashSet;
-
 
     fn get_test_data_path(zarr_store: String) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testing/data/zarr").join(zarr_store)
