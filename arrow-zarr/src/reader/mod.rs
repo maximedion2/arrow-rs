@@ -1,8 +1,63 @@
-use zarr_read::{ZarrProjection, ZarrRead, ZarrInMemoryChunk, ZarrInMemoryArray};
+//! A module tha provides a sychronous reader for zarr store, to generate [`RecordBatch`]es.
+//! 
+//! ```
+//! # use arrow_zarr::reader::{ZarrRecordBatchReaderBuilder, ZarrProjection};
+//! # use arrow_cast::pretty::pretty_format_batches;
+//! # use arrow_array::RecordBatch;
+//! # use std::path::PathBuf;
+//! #
+//! # fn get_test_data_path(zarr_store: String) -> PathBuf {
+//! #    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testing/data/zarr").join(zarr_store)
+//! # }
+//! #
+//! # fn assert_batches_eq(batches: &[RecordBatch], expected_lines: &[&str]) {
+//! #     let formatted = pretty_format_batches(batches).unwrap().to_string();
+//! #     let actual_lines: Vec<_> = formatted.trim().lines().collect();
+//! #     assert_eq!(
+//! #          &actual_lines, expected_lines,
+//! #          "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+//! #          expected_lines, actual_lines
+//! #      );
+//! #  }
+//! 
+//! // The ZarrRead trait is implemented for PathBuf, so as long as it points
+//! // to a directory with a valid zarr store, it can be used to initialize
+//! // a zarr reader builder.
+//! let p: PathBuf = get_test_data_path("lat_lon_example.zarr".to_string());
+//! 
+//! let proj = ZarrProjection::keep(vec!["lat".to_string(), "float_data".to_string()]);
+//! let builder = ZarrRecordBatchReaderBuilder::new(p).with_projection(proj);
+//! let mut reader = builder.build().unwrap();
+//! let rec_batch = reader.next().unwrap().unwrap();
+//! 
+//! assert_batches_eq(
+//!     &[rec_batch],
+//!     &[
+//!         "+------------+------+",
+//!         "| float_data | lat  |",
+//!         "+------------+------+",
+//!         "| 1001.0     | 38.0 |",
+//!         "| 1002.0     | 38.1 |",
+//!         "| 1003.0     | 38.2 |",
+//!         "| 1004.0     | 38.3 |",
+//!         "| 1012.0     | 38.0 |",
+//!         "| 1013.0     | 38.1 |",
+//!         "| 1014.0     | 38.2 |",
+//!         "| 1015.0     | 38.3 |",
+//!         "| 1023.0     | 38.0 |",
+//!         "| 1024.0     | 38.1 |",
+//!         "| 1025.0     | 38.2 |",
+//!         "| 1026.0     | 38.3 |",
+//!         "| 1034.0     | 38.0 |",
+//!         "| 1035.0     | 38.1 |",
+//!         "| 1036.0     | 38.2 |",
+//!         "| 1037.0     | 38.3 |",
+//!         "+------------+------+",
+//!     ],
+//! );
+//! ```
+
 use arrow_schema::{Field, FieldRef, Schema, DataType, TimeUnit};
-use metadata::{ZarrStoreMetadata, ZarrDataType,  CompressorType, Endianness, MatrixOrder, PY_UNICODE_SIZE};
-use filters::ZarrChunkFilter;
-use errors::{ZarrResult, ZarrError};
 use arrow_array::*;
 use std::sync::Arc;
 use arrow_data::ArrayData;
@@ -11,11 +66,18 @@ use arrow_buffer::ToByteSlice;
 use std::io::Read;
 use itertools::Itertools;
 
-pub mod metadata;
-pub mod zarr_read;
-pub mod errors;
-pub mod filters;
+use zarr_read::{ZarrRead, ZarrInMemoryArray};
+use metadata::{ZarrDataType,  CompressorType, Endianness, MatrixOrder, PY_UNICODE_SIZE};
+pub use zarr_read::{ZarrInMemoryChunk, ZarrProjection};
+pub use filters::{ZarrChunkFilter, ZarrArrowPredicate, ZarrArrowPredicateFn};
+pub use errors::{ZarrResult, ZarrError};
+pub use metadata::ZarrStoreMetadata;
 
+
+pub(crate) mod metadata;
+mod zarr_read;
+mod errors;
+mod filters;
 
 /// A zarr store that holds a reader for all the zarr data.
 pub struct ZarrStore<T: ZarrRead> {
@@ -42,8 +104,8 @@ impl<T: ZarrRead> ZarrStore<T> {
     }
 }
 
-/// A trait with a method to iterate on zarr chunks, but that allow skipping
-/// a chunk without reading it.
+/// A trait with a method to iterate on zarr chunks, but that also allows
+/// skipping a chunk without reading it.
 pub trait ZarrIterator {
     fn next_chunk(&mut self) -> Option<ZarrResult<ZarrInMemoryChunk>>;
     fn skip_chunk(&mut self);
@@ -269,8 +331,7 @@ fn decompress_lzma(chunk_data: &[u8], output: &mut [u8]) -> Result<(), ZarrError
     output.copy_from_slice(&decomp_data[..]);
     Ok(())
 }
-
-pub(crate) fn decompress_array(
+fn decompress_array(
     raw_data: Vec<u8>, uncompressed_size: usize, compressor_params: Option<&CompressorType>,
 ) -> Vec<u8> {
     if let Some(comp) = compressor_params {
@@ -310,7 +371,7 @@ fn get_3d_dim_order(order: &MatrixOrder) -> [usize; 3] {
     }
 }
 
-pub(crate) fn move_indices_to_front(buf: &mut [u8], indices: &Vec<usize>, data_size: usize) {
+fn move_indices_to_front(buf: &mut [u8], indices: &Vec<usize>, data_size: usize) {
     let mut output_idx = 0;
     for data_idx in indices {
         buf.copy_within(
@@ -321,7 +382,7 @@ pub(crate) fn move_indices_to_front(buf: &mut [u8], indices: &Vec<usize>, data_s
     }
 }
 
-pub(crate) fn process_edge_chunk(
+fn process_edge_chunk(
     buf: &mut [u8],
     chunk_dims: &Vec<usize>,
     real_dims: &Vec<usize>,
@@ -358,6 +419,11 @@ pub(crate) fn process_edge_chunk(
    move_indices_to_front(buf, &indices_to_keep, data_size);
 }
 
+/// A struct to read all the requested content from a zarr store, through the implementation
+/// of the [`Iterator`] trait, with [`Item = ZarrResult<RecordBatch>`]. Can only be created
+/// through a [`ZarrRecordBatchReaderBuilder`]. The data is read synchronously.
+/// 
+/// For an async API see [`crate::async_reader::ZarrRecordBatchStream`].
 pub struct ZarrRecordBatchReader<T: ZarrIterator> 
 {
     meta: ZarrStoreMetadata,
@@ -388,7 +454,13 @@ impl<T: ZarrIterator> ZarrRecordBatchReader<T>
         let mut arrs: Vec<ArrayRef> = Vec::with_capacity(self.meta.get_num_columns());
         let mut fields: Vec<FieldRef> = Vec::with_capacity(self.meta.get_num_columns());
 
-        for col in chunk.get_cols_in_chunk() {
+        // the sort below is important, because within a zarr store, the different arrays are
+        // not ordered, so there is no predefined order for the different columns. we effectively
+        // define one here, my ordering the columns alphabetically.
+        let mut cols = chunk.get_cols_in_chunk();
+        cols.sort();
+
+        for col in cols {
             let data = chunk.take_array(&col)?;
             let (arr, field) = self.unpack_array_chunk(
                 col.to_string(), data, chunk.get_real_dims(), self.meta.get_chunk_dims(), final_indices
@@ -455,6 +527,8 @@ impl<T: ZarrIterator> ZarrRecordBatchReader<T>
     }
 }
 
+/// The [`Iterator`] trait implementation for a [`ZarrRecordBatchReader`]. Provides the interface
+/// through which the record batches can be retrieved.
 impl<T: ZarrIterator> Iterator for ZarrRecordBatchReader<T>
 {
     type Item = ZarrResult<RecordBatch>;
@@ -546,6 +620,10 @@ impl<T: ZarrIterator> Iterator for ZarrRecordBatchReader<T>
     }
 }
 
+/// A builder used to construct a [`ZarrRecordBatchReader`] for a folder containing a
+/// zarr store. 
+/// 
+/// To build the equivalent asynchronous reader see [`crate::async_reader::ZarrRecordBatchStreamBuilder`].
 pub struct ZarrRecordBatchReaderBuilder<T: ZarrRead + Clone> 
 {
     zarr_reader: T,
@@ -554,18 +632,26 @@ pub struct ZarrRecordBatchReaderBuilder<T: ZarrRead + Clone>
 }
 
 impl<T: ZarrRead + Clone> ZarrRecordBatchReaderBuilder<T> {
+    /// Create a [`ZarrRecordBatchReaderBuilder`] from a [`ZarrRead`] struct. 
     pub fn new(zarr_reader: T) -> Self {
         Self{zarr_reader, projection: ZarrProjection::all(), filter: None}
     }
 
+    /// Adds a column projection to the builder, so that the resulting reader will only
+    /// read some of the columns (zarr arrays) from the zarr store.
     pub fn with_projection(self, projection: ZarrProjection) -> Self {
         Self {projection: projection, ..self}
     }
 
+    /// Adds a row filter to the builder, so that the resulting reader will only
+    /// read rows that satisfy some conditions from the zarr store.
     pub fn with_filter(self, filter: ZarrChunkFilter) -> Self {
         Self {filter: Some(filter), ..self}
     }
 
+    /// Build a [`ZarrRecordBatchReader`], consuming the builder. The option range
+    /// argument controls the start and end chunk (following the way zarr chunks are
+    /// named and numbered).
     pub fn build_partial_reader(self, chunk_range: Option<(usize, usize)>) -> ZarrResult<ZarrRecordBatchReader<ZarrStore<T>>> {
         let meta = self.zarr_reader.get_zarr_metadata()?;
         let mut chunk_pos: Vec<Vec<usize>> = meta.get_chunk_positions();
@@ -588,6 +674,8 @@ impl<T: ZarrRead + Clone> ZarrRecordBatchReaderBuilder<T> {
         Ok(ZarrRecordBatchReader::new(meta, Some(zarr_store), self.filter, predicate_store))
     }
 
+    /// Build a [`ZarrRecordBatchReader`], consuming the builder. The resulting reader
+    /// will read all the chunks in the zarr store.
     pub fn build(self) -> ZarrResult<ZarrRecordBatchReader<ZarrStore<T>>> {
         self.build_partial_reader(None)
     }
@@ -599,10 +687,11 @@ mod zarr_reader_tests {
     use arrow_array::types::*;
     use arrow_schema::{DataType, TimeUnit};
     use itertools::enumerate;
-    use crate::reader::filters::{ZarrArrowPredicateFn, ZarrArrowPredicate};
     use arrow::compute::kernels::cmp::{gt_eq, lt};
-    use super::*;
     use std::{path::PathBuf, collections::HashMap, fmt::Debug, boxed::Box};
+
+    use super::*;
+    use crate::reader::filters::{ZarrArrowPredicateFn, ZarrArrowPredicate};
 
     fn get_test_data_path(zarr_store: String) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testing/data/zarr").join(zarr_store)
@@ -741,7 +830,6 @@ mod zarr_reader_tests {
         validate_names_and_types(&target_types, rec);
         validate_bool_column(&"bool_data", rec, &[false, true, false, false, true, false, false, true, false]);
         validate_primitive_column::<Int64Type, i64>(&"int_data", rec, &[-4, -3, -2, 4, 5, 6, 12, 13, 14]);
-
     }
 
     #[test]
@@ -974,7 +1062,6 @@ mod zarr_reader_tests {
         );
         filters.push(Box::new(f));
 
-        // build the reader with the filters
         builder = builder.with_filter(ZarrChunkFilter::new(filters));
         let reader = builder.build().unwrap();
         let records: Vec<RecordBatch> = reader.map(|x| x.unwrap()).collect();
@@ -1022,5 +1109,29 @@ mod zarr_reader_tests {
         validate_primitive_column::<Float64Type, f64>(
             &"float_data", rec, &[1053.0, 1054.0, 1055.0, 1064.0, 1065.0, 1066.0, 1075.0, 1076.0, 1077.0, 1086.0, 1087.0, 1088.0]
         );
+    }
+
+    #[test]
+    fn empty_query_tests() {
+        let p = get_test_data_path("lat_lon_example.zarr".to_string());
+        let mut builder = ZarrRecordBatchReaderBuilder::new(p);
+
+        // set a filter that will filter out all the data, there should be nothing left after
+        // we apply it.
+        let mut filters: Vec<Box<dyn ZarrArrowPredicate>> = Vec::new();
+        let f = ZarrArrowPredicateFn::new(
+            ZarrProjection::keep(vec!["lat".to_string()]),
+            move |batch| (
+                gt_eq(batch.column_by_name("lat").unwrap(), &Scalar::new(&Float64Array::from(vec![100.0])))
+            ),
+        );
+        filters.push(Box::new(f));
+
+        builder = builder.with_filter(ZarrChunkFilter::new(filters));
+        let reader = builder.build().unwrap();
+        let records: Vec<RecordBatch> = reader.map(|x| x.unwrap()).collect();
+
+        // there should be no records, because of the filter.
+        assert_eq!(records.len(), 0);
     }
 }

@@ -1,25 +1,31 @@
-use crate::reader::zarr_read::ZarrProjection;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::ArrowError;
 use dyn_clone::{DynClone, clone_trait_object};
 
-/// A predicate operating on [`RecordBatch`]
+use crate::reader::ZarrProjection;
+
+
+/// A predicate operating on [`RecordBatch`]. Here we have the [`DynClone`] trait
+/// bound because when dealing with the async zarr reader, it's useful to be able
+/// to clone filters.
 pub trait ZarrArrowPredicate: Send + DynClone + 'static {
     /// Returns the [`ZarrProjecction`] that describes the columns required
     /// to evaluate this predicate. Those must be present in record batches
-    /// that aare passed into the [`evaluate`] method.
+    /// that are passed into the [`evaluate`] method.
     fn projection(&self) -> &ZarrProjection;
 
     /// Evaluate this predicate for the given [`RecordBatch`] containing the columns
     /// identified by [`projection`]. Rows that are `true` in the returned [`BooleanArray`]
     /// satisfy the predicate condition, whereas those that are `false` or do not.
-    /// The method should not return any `Null` values.
+    /// The method should not return any `Null` values. Note that the [`RecordBatch`] is
+    /// passed by reference and not consumed by the method.
     fn evaluate(&mut self, batch: &RecordBatch) -> Result<BooleanArray, ArrowError>;
 }
 clone_trait_object!(ZarrArrowPredicate);
 
 
-/// A [`ZarrArrowPredicate`] created from an [`FnMut`]
+/// A [`ZarrArrowPredicate`] created from an [`FnMut`]. The predicate function has
+/// to be [`Clone`] because of the trait bound on [`ZarrArrowPredicate`].
 #[derive(Clone)]
 pub struct ZarrArrowPredicateFn<F> {
     f: F,
@@ -35,6 +41,7 @@ where
     }
 }
 
+
 impl<F> ZarrArrowPredicate for ZarrArrowPredicateFn<F>
 where
     F: FnMut(&RecordBatch) -> Result<BooleanArray, ArrowError> + Send + Clone + 'static,
@@ -49,7 +56,24 @@ where
 }
 
 
-/// A collection of one or more objects that implement [`ZarrArrowPredicate`]
+/// A collection of one or more objects that implement [`ZarrArrowPredicate`]. The way
+/// filters are used for zarr store is by determining whether or not the a chunk needs to be
+/// read based on the predicate. First, only the columns needed in the predicate are read,
+/// then the predicate is evaluated, and if there is a least one row that satistifes the
+/// condition, the other variables that we requested are read.
+/// 
+/// When the predicate is evaluated, the row indices that satisfy the predicate are carried
+/// over to when the reuqested data is fetched. However, because zarr data is typically
+/// compressed, here even when we have a subset of the rows to read, the whole chunk is read,
+/// and the rows mask is applied after.
+/// 
+/// Additionally, if the data needed for the predicate is also requested, it is read twice,
+/// once for the predicate and once when the actual data is fetched. In the end, if a lot of
+/// columns are being requested, and the predicate only needs a few columns, AND if the 
+/// predicate only evaluates to true for the data in a small fraction of the chunks, then
+/// a lot of data reads can be avoided. Under other circumstances though, applying filters
+/// that way could be somewhat inefficient, but there's not much else that can be done,
+/// considering the typical structure of zarr data (and that it's typically compressed).
 #[derive(Clone)]
 pub struct ZarrChunkFilter {
     /// A list of [`ZarrArrowPredicate`]
@@ -76,13 +100,14 @@ impl ZarrChunkFilter {
 
 #[cfg(test)]
 mod zarr_predicate_tests {
-    use super::*;
     use arrow_array::RecordBatch;
     use std::sync::Arc;
     use arrow_schema::{Schema, Field, DataType};
     use arrow_array::{BooleanArray, Float64Array, ArrayRef};
-    use crate::reader::zarr_read::ZarrProjection;
     use arrow::compute::kernels::cmp::eq;
+
+    use super::*;
+    use crate::reader::ZarrProjection;
 
     fn generate_rec_batch() -> RecordBatch {
         let fields = vec![

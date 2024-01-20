@@ -1,19 +1,20 @@
 use itertools::Itertools;
-use crate::reader::metadata::ZarrStoreMetadata;
 use std::collections::{HashMap, HashSet};
 use std::fs::{read_to_string, read};
 use std::path::PathBuf;
-use crate::reader::errors::{ZarrError, ZarrResult};
+
+use crate::reader::ZarrStoreMetadata;
+use crate::reader::{ZarrError, ZarrResult};
 
 /// An in-memory representation of the data contained in one chunk
-/// of one zarr array. 
+/// of one zarr array (a single variable). 
 #[derive(Debug, Clone)]
 pub struct ZarrInMemoryArray {
     pub(crate) data: Vec<u8>,
 }
 
 impl ZarrInMemoryArray {
-    pub fn new(data: Vec<u8>) -> Self {
+    pub(crate) fn new(data: Vec<u8>) -> Self {
         Self {data}
     }
 
@@ -22,8 +23,8 @@ impl ZarrInMemoryArray {
     }
 }
 
-/// An in-memory representation of the data contained in one chunk
-/// of one whole zarr store with one or more zarr arrays. 
+/// An in-memory representation of the data contained in one chunk of one
+/// whole zarr store with one or more zarr arrays (one or more variables). 
 #[derive(Debug, Default)]
 pub struct ZarrInMemoryChunk {
     pub(crate) data: HashMap<String, ZarrInMemoryArray>,
@@ -67,7 +68,7 @@ pub(crate) enum ProjectionType {
 }
 
 /// A structure to handle skipping or selecting specific columns (zarr arrays) from
-/// a zarr store. 
+/// a zarr store.
 #[derive(Clone)]
 pub struct ZarrProjection {
     projection_type: ProjectionType,
@@ -155,7 +156,7 @@ pub trait ZarrRead {
     ) -> ZarrResult<ZarrInMemoryChunk>;
 }
 
-/// Implementation of the [`ZarrRead`] trait for a path buffer which contains the
+/// Implementation of the [`ZarrRead`] trait for a [`PathBuf`] which contains the
 /// path to a zarr store.
 impl ZarrRead for PathBuf {
     fn get_zarr_metadata(&self) -> ZarrResult<ZarrStoreMetadata> {
@@ -205,15 +206,17 @@ impl ZarrRead for PathBuf {
 
 #[cfg(test)]
 mod zarr_read_tests {
-    use super::*;
-    use crate::reader::metadata::{ZarrDataType, MatrixOrder, Endianness, ZarrArrayMetadata};
     use std::path::PathBuf;
     use std::collections::HashSet;
+
+    use super::*;
+    use crate::reader::metadata::{ZarrDataType, MatrixOrder, Endianness, ZarrArrayMetadata};
 
     fn get_test_data_path(zarr_store: String) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testing/data/zarr").join(zarr_store)
     }
 
+    // read the store metadata, given a path to a zarr store.
     #[test]
     fn read_metadata() {
         let p = get_test_data_path("raw_bytes_example.zarr".to_string());
@@ -242,6 +245,8 @@ mod zarr_read_tests {
         );
     }
 
+    // read the raw data contained into a zarr store. one of the variables contains
+    // byte data, which we explicitly check here.
     #[test]
     fn read_raw_chunks() {
         let p = get_test_data_path("raw_bytes_example.zarr".to_string());

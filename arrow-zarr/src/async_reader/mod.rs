@@ -1,9 +1,77 @@
-use crate::async_reader::zarr_read_async::ZarrReadAsync;
-use crate::reader::zarr_read::{ZarrProjection, ZarrInMemoryChunk};
-use crate::reader::errors::{ZarrResult, ZarrError};
-use crate::reader::metadata::ZarrStoreMetadata;
-use crate::reader::filters::ZarrChunkFilter;
-use crate::reader::{unwrap_or_return, ZarrRecordBatchReader, ZarrIterator};
+//! A module tha provides an asychronous reader for zarr store, to generate [`RecordBatch`]es.
+//! 
+//! ```
+//! # #[tokio::main(flavor="current_thread")]
+//! # async fn main() {
+//! #
+//! # use arrow_zarr::async_reader::{ZarrPath, ZarrRecordBatchStreamBuilder};
+//! # use arrow_zarr::reader::ZarrProjection;
+//! # use arrow_cast::pretty::pretty_format_batches;
+//! # use arrow_array::RecordBatch;
+//! # use object_store::{path::Path, local::LocalFileSystem};
+//! # use std::path::PathBuf;
+//! # use std::sync::Arc;
+//! # use futures::stream::Stream;
+//! # use futures_util::TryStreamExt;
+//! #
+//! # fn get_test_data_path(zarr_store: String) -> ZarrPath {
+//! #   let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+//! #                   .parent()
+//! #                   .unwrap()
+//! #                   .join("testing/data/zarr")
+//! #                 . join(zarr_store);
+//! #   ZarrPath::new(
+//! #       Arc::new(LocalFileSystem::new()),
+//! #       Path::from_absolute_path(p).unwrap()
+//! #   )
+//! # }
+//! #
+//! # fn assert_batches_eq(batches: &[RecordBatch], expected_lines: &[&str]) {
+//! #     let formatted = pretty_format_batches(batches).unwrap().to_string();
+//! #     let actual_lines: Vec<_> = formatted.trim().lines().collect();
+//! #     assert_eq!(
+//! #          &actual_lines, expected_lines,
+//! #          "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+//! #          expected_lines, actual_lines
+//! #      );
+//! #  }
+//! 
+//! // The ZarrReadAsync trait is implemented for the ZarrPath struct.
+//! let p: ZarrPath = get_test_data_path("lat_lon_example.zarr".to_string());
+//! 
+//! let proj = ZarrProjection::keep(vec!["lat".to_string(), "float_data".to_string()]);
+//! let builder = ZarrRecordBatchStreamBuilder::new(p).with_projection(proj);
+//! let mut stream = builder.build().await.unwrap();
+//! let mut rec_batches: Vec<_> = stream.try_collect().await.unwrap();
+//! 
+//! assert_batches_eq(
+//!     &[rec_batches.remove(0)],
+//!     &[
+//!         "+------------+------+",
+//!         "| float_data | lat  |",
+//!         "+------------+------+",
+//!         "| 1001.0     | 38.0 |",
+//!         "| 1002.0     | 38.1 |",
+//!         "| 1003.0     | 38.2 |",
+//!         "| 1004.0     | 38.3 |",
+//!         "| 1012.0     | 38.0 |",
+//!         "| 1013.0     | 38.1 |",
+//!         "| 1014.0     | 38.2 |",
+//!         "| 1015.0     | 38.3 |",
+//!         "| 1023.0     | 38.0 |",
+//!         "| 1024.0     | 38.1 |",
+//!         "| 1025.0     | 38.2 |",
+//!         "| 1026.0     | 38.3 |",
+//!         "| 1034.0     | 38.0 |",
+//!         "| 1035.0     | 38.1 |",
+//!         "| 1036.0     | 38.2 |",
+//!         "| 1037.0     | 38.3 |",
+//!         "+------------+------+",
+//!     ],
+//!  );
+//! # }
+//! ```
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use futures::{ready, FutureExt};
@@ -11,6 +79,13 @@ use futures::stream::Stream;
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
 use arrow_array::{RecordBatch, BooleanArray};
+
+use crate::reader::{ZarrProjection, ZarrInMemoryChunk};
+use crate::reader::{ZarrResult, ZarrError};
+use crate::reader::{ZarrStoreMetadata, ZarrChunkFilter};
+use crate::reader::{unwrap_or_return, ZarrRecordBatchReader, ZarrIterator};
+
+pub use crate::async_reader::zarr_read_async::{ZarrPath, ZarrReadAsync};
 
 pub mod zarr_read_async;
 
@@ -40,12 +115,16 @@ impl<T: ZarrReadAsync> ZarrStoreAsync<T> {
     }
 }
 
+/// A trait exposing a method to asynchronously get zarr chunk data, but also to
+/// skip a chunk if needed.
 #[async_trait]
 pub trait ZarrStream {
     async fn poll_next_chunk(&mut self) -> Option<ZarrResult<ZarrInMemoryChunk>>;
     fn skip_next_chunk(&mut self);
 }
 
+/// Implementation of the [`ZarrStream`] trait for the [`ZarrStoreAsync`] struct, which
+/// itself holds an asynchronous reader for the zarr data.
 #[async_trait]
 impl<T> ZarrStream for ZarrStoreAsync<T> 
 where
@@ -129,6 +208,11 @@ enum ZarrStreamState<T: ZarrStream> {
     Error,
 }
 
+/// A struct to read all the requested content from a zarr store, through the implementation
+/// of the [`Stream`] trait, with [`Item = ZarrResult<RecordBatch>`]. Can only be created
+/// through a [`ZarrRecordBatchStreamBuilder`]. The data is read asynchronously.
+/// 
+/// For a sync API see [`crate::reader::ZarrRecordBatchReader`].
 pub struct ZarrRecordBatchStream<T: ZarrStream> 
 {
     meta: ZarrStoreMetadata,
@@ -167,7 +251,10 @@ impl<T: ZarrStream> ZarrRecordBatchStream<T> {
     }
 }
 
+
 const LOST_STORE_ERR: &str = "unexpectedly lost store wrapper in zarr record batch stream";
+/// The [`Stream`] trait implementation for a [`ZarrRecordBatchStream`]. Provides the interface
+/// through which the record batches can be retrieved.
 impl<T> Stream for ZarrRecordBatchStream<T> 
 where
     T: ZarrStream + Unpin + Send + 'static,
@@ -298,6 +385,9 @@ where
     }
 }
 
+/// A builder used to construct a [`ZarrRecordBatchStream`] for a zarr store.
+/// 
+/// To build the equivalent synchronous reader see [`crate::reader::ZarrRecordBatchReaderBuilder`].
 pub struct ZarrRecordBatchStreamBuilder<T: ZarrReadAsync + Clone + Unpin + Send> 
 {
     zarr_reader_async: T,
@@ -306,18 +396,26 @@ pub struct ZarrRecordBatchStreamBuilder<T: ZarrReadAsync + Clone + Unpin + Send>
 }
 
 impl<T: ZarrReadAsync + Clone + Unpin + Send + 'static> ZarrRecordBatchStreamBuilder<T> {
+    /// Create a [`ZarrRecordBatchStreamBuilder`] from a [`ZarrReadAsync`] struct. 
     pub fn new(zarr_reader_async: T) -> Self {
         Self{zarr_reader_async, projection: ZarrProjection::all(), filter: None}
     }
 
+    /// Adds a column projection to the builder, so that the resulting reader will only
+    /// read some of the columns (zarr arrays) from the zarr store.
     pub fn with_projection(self, projection: ZarrProjection) -> Self {
         Self {projection: projection, ..self}
     }
 
+    /// Adds a row filter to the builder, so that the resulting reader will only
+    /// read rows that satisfy some conditions from the zarr store.
     pub fn with_filter(self, filter: ZarrChunkFilter) -> Self {
         Self {filter: Some(filter), ..self}
     }
 
+    /// Build a [`ZarrRecordBatchStream`], consuming the builder. The option range
+    /// argument controls the start and end chunk (following the way zarr chunks are
+    /// named and numbered).
     pub async fn build_partial_reader(
         self, chunk_range: Option<(usize, usize)>
     ) -> ZarrResult<ZarrRecordBatchStream<ZarrStoreAsync<T>>> {
@@ -346,6 +444,8 @@ impl<T: ZarrReadAsync + Clone + Unpin + Send + 'static> ZarrRecordBatchStreamBui
         Ok(ZarrRecordBatchStream::new(meta, zarr_stream, self.filter, predicate_stream))
     }
 
+    /// Build a [`ZarrRecordBatchStream`], consuming the builder. The resulting reader
+    /// will read all the chunks in the zarr store.
     pub async fn build(self) -> ZarrResult<ZarrRecordBatchStream<ZarrStoreAsync<T>>> {
         self.build_partial_reader(None).await
     }
@@ -353,20 +453,20 @@ impl<T: ZarrReadAsync + Clone + Unpin + Send + 'static> ZarrRecordBatchStreamBui
 
 #[cfg(test)]
 mod zarr_async_reader_tests {
-    use super::*;
-    use arrow_array::types::*;
     use arrow_array::*;
+    use arrow_array::types::*;
     use arrow_array::cast::AsArray;
     use arrow_schema::DataType;
-    use crate::async_reader::zarr_read_async::ZarrPath;
     use futures_util::TryStreamExt;
-    use object_store::path::Path;
-    use object_store::local::LocalFileSystem;
+    use object_store::{path::Path, local::LocalFileSystem};
     use std::sync::Arc;
     use itertools::enumerate;
-    use std::{path::PathBuf, collections::HashMap, fmt::Debug};
-    use crate::reader::filters::{ZarrArrowPredicateFn, ZarrArrowPredicate};
     use arrow::compute::kernels::cmp::{gt_eq, lt};
+    use std::{path::PathBuf, collections::HashMap, fmt::Debug};
+
+    use super::*;
+    use crate::async_reader::zarr_read_async::ZarrPath;
+    use crate::reader::{ZarrArrowPredicateFn, ZarrArrowPredicate};
 
     fn get_test_data_path(zarr_store: String) -> ZarrPath {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -539,5 +639,29 @@ mod zarr_async_reader_tests {
         validate_primitive_column::<Float64Type, f64>(
             &"float_data_no_comp", rec, &[251.0, 252.0, 253.0, 259.0, 260.0, 261.0]
         );
+    }
+
+    #[tokio::test]
+    async fn empty_query_tests() {
+        let zp = get_test_data_path("lat_lon_example.zarr".to_string());
+        let mut builder = ZarrRecordBatchStreamBuilder::new(zp);
+
+        // set a filter that will filter out all the data, there should be nothing left after
+        // we apply it.
+        let mut filters: Vec<Box<dyn ZarrArrowPredicate>> = Vec::new();
+        let f = ZarrArrowPredicateFn::new(
+            ZarrProjection::keep(vec!["lat".to_string()]),
+            move |batch| (
+                gt_eq(batch.column_by_name("lat").unwrap(), &Scalar::new(&Float64Array::from(vec![100.0])))
+            ),
+        );
+        filters.push(Box::new(f));
+
+        builder = builder.with_filter(ZarrChunkFilter::new(filters));
+        let stream = builder.build().await.unwrap();
+        let records: Vec<_> = stream.try_collect().await.unwrap();
+
+        // there should be no records, because of the filter.
+        assert_eq!(records.len(), 0);
     }
 }

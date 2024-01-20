@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use regex::Regex;
 use itertools::Itertools;
-use crate::reader::errors::{ZarrError, ZarrResult};
+use crate::reader::{ZarrError, ZarrResult};
 
-// various enums for the properties of the zarr store and
-// arrays metadata.
+// Various enums for the properties of the zarr arrays data.
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum CompressorType {
     Blosc,
@@ -86,7 +85,9 @@ impl ZarrArrayMetadata {
 
 /// The metadata for a zarr store made up of one or more zarr arrays,
 /// holding the metadata for all of the arrays and the parameters
-/// that have to be consistent across all the arrays.
+/// that have to be consistent across all the arrays. Notably, all the
+/// arrays must have the same number of chunks and the chunks must all
+/// be of the same size.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ZarrStoreMetadata {
     columns: Vec<String>,
@@ -176,6 +177,7 @@ fn extract_type(dtype: &str) -> ZarrResult<ZarrDataType> {
 }
 
 impl ZarrStoreMetadata {
+    // creates an empty store metadata structure.
     pub(crate) fn new() -> Self {
         Self {
             columns: Vec::new(),
@@ -186,6 +188,7 @@ impl ZarrStoreMetadata {
         }
     }
 
+    // adds the metadata for one column (variable) to the store metadata.
     pub(crate) fn add_column(&mut self, col_name: String, metadata_str: &str) -> ZarrResult<()> {
         // extract compressor type
         let j: Result<RawOuterCompParams, serde_json::Error> =
@@ -198,7 +201,7 @@ impl ZarrStoreMetadata {
                 "bz2" => Some(CompressorType::Bz2),
                 _ => return Err(
                     ZarrError::InvalidMetadata(
-                        "invalid compressor params in zarr metadata".to_string()
+                        "Invalid compressor params in zarr metadata".to_string()
                     )
                 )
             }
@@ -209,7 +212,7 @@ impl ZarrStoreMetadata {
             } else {
                 return Err(
                     ZarrError::InvalidMetadata(
-                        "invalid compressor params in zarr metadata".to_string()
+                        "Invalid compressor params in zarr metadata".to_string()
                     )
                 )
             }
@@ -228,6 +231,9 @@ impl ZarrStoreMetadata {
                     )
                 }
             }
+            if raw_params.chunks.len() > 3 {
+                return Err(ZarrError::InvalidMetadata("Chunk dimensionality must not exceed 3".to_string()))
+            }
 
             // verify that all arrays have the same shape
             if let Some(shp) = &self.shape {
@@ -239,6 +245,9 @@ impl ZarrStoreMetadata {
                     )
                 }
             }
+            if raw_params.shape.len() > 3 {
+                return Err(ZarrError::InvalidMetadata("Shape dimensionality must not exceed 3".to_string()))
+            }
 
 
             // extract matrix order, endianness and data type
@@ -247,7 +256,7 @@ impl ZarrStoreMetadata {
                 "F" => MatrixOrder::ColumnMajor,
                 _ => return Err(
                     ZarrError::InvalidMetadata(
-                        "invalid matrix order in zarr metadata".to_string()
+                        "Invalid matrix order in zarr metadata".to_string()
                     )
                 )
             };
@@ -257,7 +266,7 @@ impl ZarrStoreMetadata {
                 '>' => Endianness::Big,
                 _ => return Err(
                     ZarrError::InvalidMetadata(
-                        "cannot extract endiannes from dtype in zarr metadata".to_string()
+                        "Cannot extract endiannes from dtype in zarr metadata".to_string()
                     )
                 ),
             };
@@ -319,6 +328,7 @@ impl ZarrStoreMetadata {
         self.chunks.as_ref().unwrap()
     }
 
+    // get the indices of all the chunks, as a 1D, 2D or 3D vector, for each chunk.
     pub(crate) fn get_chunk_positions(&self) -> Vec<Vec<usize>> {
         let shape = self.shape.as_ref().unwrap();
         let chunks = self.chunks.as_ref().unwrap();
@@ -350,6 +360,8 @@ impl ZarrStoreMetadata {
         grid_positions
     }
 
+    // return the real dimensions of a chhunk, given its position, taking into
+    // account that it can be at the "edge" of the array for one or more dimension.
     pub(crate) fn get_real_dims(&self, pos: &Vec<usize>) -> Vec<usize> {
         pos.iter()
             .zip(self.last_chunk_idx.as_ref().unwrap())
@@ -373,11 +385,11 @@ impl ZarrStoreMetadata {
 mod zarr_metadata_tests {
     use super::*;
 
+    // test various valid metadata strings.
     #[test]
     fn test_valid_metadata() {
         let mut meta = ZarrStoreMetadata::new();
 
-        // first column, var1
         let metadata_str = r#"
         {
             "zarr_format": 2,
@@ -389,7 +401,6 @@ mod zarr_metadata_tests {
         }"#;
         meta.add_column("var1".to_string(), &metadata_str).unwrap();
 
-        // second column, var2
         let metadata_str = r#"
         {
             "zarr_format": 2,
@@ -401,7 +412,6 @@ mod zarr_metadata_tests {
         }"#;
         meta.add_column("var2".to_string(), &metadata_str).unwrap();
 
-        // third column, var3
         let metadata_str = r#"
         {
             "zarr_format": 2,
@@ -413,7 +423,6 @@ mod zarr_metadata_tests {
         }"#;
         meta.add_column("var3".to_string(), &metadata_str).unwrap();
 
-        // third column, var4
         let metadata_str = r#"
         {
             "zarr_format": 2,
@@ -491,6 +500,8 @@ mod zarr_metadata_tests {
 
     }
 
+    // test various metadata strings that are invalid and should results in an
+    // error being returned.
     #[test]
     fn test_invalid_metadata() {
         let mut meta = ZarrStoreMetadata::new();

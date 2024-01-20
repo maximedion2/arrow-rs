@@ -1,10 +1,10 @@
-use crate::reader::metadata::ZarrStoreMetadata;
-use crate::reader::errors::{ZarrResult, ZarrError};
-use crate::reader::zarr_read::ZarrInMemoryChunk;
 use async_trait::async_trait;
 use object_store::{ObjectStore, path::Path};
 use std::sync::Arc;
 use futures_util::{pin_mut, StreamExt};
+
+use crate::reader::{ZarrStoreMetadata, ZarrInMemoryChunk};
+use crate::reader::{ZarrResult, ZarrError};
 
 /// A trait that exposes methods to get data from a zarr store asynchronously.
 #[async_trait]
@@ -23,6 +23,9 @@ pub trait ZarrReadAsync {
     ) -> ZarrResult<ZarrInMemoryChunk>;
 }
 
+
+/// A wrapper around a pointer to an [`ObjectStore`] an a path that points
+/// to a zarr store.
 #[derive(Debug, Clone)]
 pub struct ZarrPath {
     store: Arc<dyn ObjectStore>,
@@ -86,14 +89,14 @@ impl ZarrReadAsync for ZarrPath {
 
 #[cfg(test)]
 mod zarr_read_async_tests {
-    use super::*;
-    use object_store::path::Path;
-    use crate::reader::metadata::{ZarrDataType, MatrixOrder, Endianness, ZarrArrayMetadata};
-    use crate::reader::zarr_read::ZarrProjection;
-    use object_store::local::LocalFileSystem;
+    use object_store::{path::Path, local::LocalFileSystem};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::collections::HashSet;
+
+    use super::*;
+    use crate::reader::metadata::{ZarrDataType, MatrixOrder, Endianness, ZarrArrayMetadata};
+    use crate::reader::ZarrProjection;
 
     fn get_test_data_file_system() -> LocalFileSystem {
         LocalFileSystem::new_with_prefix(

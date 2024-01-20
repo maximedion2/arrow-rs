@@ -5,6 +5,7 @@ use arrow_schema::ArrowError;
 use object_store::Error as ObjStoreError;
 use std::str::Utf8Error;
 
+/// An error enumeration for the zarr operations in the crate.
 #[derive(Debug)]
 pub enum ZarrError {
     InvalidMetadata(String),
@@ -62,4 +63,5 @@ impl From<Utf8Error> for ZarrError {
     }
 }
 
+/// A specialized [`Result`] for [`ZarrError`]s.
 pub type ZarrResult<T, E = ZarrError> = Result<T, E>;
